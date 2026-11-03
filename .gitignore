@@ -1,0 +1,74 @@
+# Build directories
+build/
+cmake-build-*/
+*.o
+*.obj
+*.exe
+*.out
+*.app
+
+# CMake files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+
+# Qt files
+*.moc
+moc_*.cpp
+qrc_*.cpp
+ui_*.h
+*.qm
+*.ts
+OmniGuard_autogen/
+*.autogen
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Compiled binaries
+OmniGuard
+OmniGuard.exe
+*.so
+*.dll
+*.dylib
+*.a
+*.lib
+
+# Qt Creator
+*.pro.user
+*.pro.user.*
+
+# CCache
+.ccache/
+
+# Logs
+*.log
+
+# Configuration files (local overrides)
+cameras.json
+*.json.local
+
+# Documentation build
+docs/build/
+*.pdf
+
+# Test outputs
+test-results/
+coverage/
+
+# Package managers
+conan.lock
+vcpkg_installed/
+
+# Temporary files
+*.tmp
+*.temp
+cache/

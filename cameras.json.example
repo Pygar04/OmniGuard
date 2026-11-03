@@ -1,0 +1,41 @@
+{
+    "cameras": [
+        {
+            "id": 0,
+            "name": "Camera 1 - Ingresso",
+            "rtspUrl": "rtsp://melnyknadiya82@gmail.com:Sicurezza3007@192.168.1.12:554/video1",
+            "username": "",
+            "password": "",
+            "reconnectIntervalMs": 3000,
+            "connectionTimeoutMs": 10000,
+            "receiveTimeoutMs": 5000,
+            "enableTcp": true,
+            "enableBuffering": true
+        },
+        {
+            "id": 1,
+            "name": "Camera 2 - Giardino",
+            "rtspUrl": "rtsp://melnyknadiya82@gmail.com:Sicurezza3007@192.168.1.13:554/video1",
+            "username": "",
+            "password": "",
+            "reconnectIntervalMs": 3000,
+            "connectionTimeoutMs": 10000,
+            "receiveTimeoutMs": 5000,
+            "enableTcp": true,
+            "enableBuffering": true
+        },
+        {
+            "id": 2,
+            "name": "Camera 3 - Garage",
+            "rtspUrl": "rtsp://melnyknadiya82@gmail.com:Sicurezza3007@192.168.1.14:554/video1",
+            "username": "",
+            "password": "",
+            "reconnectIntervalMs": 3000,
+            "connectionTimeoutMs": 10000,
+            "receiveTimeoutMs": 5000,
+            "enableTcp": true,
+            "enableBuffering": true
+        }
+    ],
+    "version": 1
+}
