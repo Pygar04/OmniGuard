@@ -57,5 +57,37 @@ target_compile_options(${PROJECT_NAME} PRIVATE
     -fPIC
 )
 
-# Install target (optional)
-install(TARGETS ${PROJECT_NAME} DESTINATION bin)
+# ============================================================================
+# Installazione (percorsi standard Linux: compare nel menu applicazioni)
+# ============================================================================
+include(GNUInstallDirs)
+
+install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(PROGRAMS packaging/omniguard-watchdog DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(FILES packaging/omniguard.desktop DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
+install(FILES resources/omniguard.svg DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps)
+install(FILES cameras.json.example README.md DESTINATION ${CMAKE_INSTALL_DOCDIR})
+
+# ============================================================================
+# Pacchetto .deb (Debian / Ubuntu / Mint):  cd build && cpack
+# ============================================================================
+set(CPACK_GENERATOR "DEB")
+set(CPACK_PACKAGE_NAME "omniguard")
+set(CPACK_PACKAGE_VENDOR "Pygar04")
+set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Videosorveglianza per 3 telecamere IP RTSP (Zosi)")
+set(CPACK_PACKAGE_DESCRIPTION "Applicazione desktop Qt6/FFmpeg per il monitoraggio 24/7 di 3 telecamere IP via RTSP, con riconnessione automatica.")
+set(CPACK_PACKAGE_HOMEPAGE_URL "https://github.com/Pygar04/OmniGuard")
+set(CPACK_PACKAGING_INSTALL_PREFIX "/usr")
+set(CPACK_STRIP_FILES ON)
+
+set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
+set(CPACK_DEBIAN_PACKAGE_MAINTAINER "Pygar04 <101059425+Pygar04@users.noreply.github.com>")
+set(CPACK_DEBIAN_PACKAGE_SECTION "video")
+# Le librerie collegate (Qt6, FFmpeg) vengono rilevate automaticamente con dpkg-shlibdeps;
+# i plugin Qt caricati a runtime vanno dichiarati a mano.
+set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+set(CPACK_DEBIAN_PACKAGE_DEPENDS "qt6-qpa-plugins, libqt6svg6")
+set(CPACK_DEBIAN_PACKAGE_RECOMMENDS "qt6-wayland")
+
+include(CPack)

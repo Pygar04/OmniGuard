@@ -13,10 +13,59 @@
 #include <QVBoxLayout>
 #include <QStyle>
 #include <QThread>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QSaveFile>
+#include <QStandardPaths>
+#include <QRegularExpression>
 
 namespace {
 
 constexpr qint64 STALE_FRAME_MS = 5000;   // nessun frame da 5s con camera "connessa" → avviso a schermo
+
+// ~/.config/autostart/omniguard.desktop (standard XDG, funziona con GNOME, KDE, XFCE, Cinnamon, MATE)
+QString autostartFilePath() {
+    return QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation)
+           + "/autostart/omniguard.desktop";
+}
+
+QString quoteExecArg(const QString& arg) {
+    if (!arg.contains(QRegularExpression("[\\s\"'\\\\$`]"))) return arg;
+    QString escaped = arg;
+    escaped.replace("\\", "\\\\").replace("\"", "\\\"").replace("`", "\\`").replace("$", "\\$");
+    return "\"" + escaped + "\"";
+}
+
+bool setAutostart(bool enabled, const QString& configPath) {
+    const QString path = autostartFilePath();
+    if (!enabled) {
+        return !QFile::exists(path) || QFile::remove(path);
+    }
+
+    // Se installato, usa omniguard-watchdog (riavvia l'app in caso di crash)
+    const QString appPath = QCoreApplication::applicationFilePath();
+    const QString watchdog = QFileInfo(appPath).absolutePath() + "/omniguard-watchdog";
+    QString exec = quoteExecArg(QFileInfo(watchdog).isExecutable() ? watchdog : appPath);
+    if (configPath != CameraConfigManager::defaultConfigPath()) {
+        exec += " -c " + quoteExecArg(configPath);
+    }
+
+    QDir().mkpath(QFileInfo(path).absolutePath());
+    QSaveFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) return false;
+    file.write(QString(
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Name=OmniGuard\n"
+        "Comment=Videosorveglianza (avvio automatico)\n"
+        "Exec=%1\n"
+        "Icon=omniguard\n"
+        "Terminal=false\n"
+        "X-GNOME-Autostart-enabled=true\n"
+        "X-GNOME-Autostart-Delay=5\n").arg(exec).toUtf8());
+    return file.commit();
+}
 
 const char* stateText(CameraState s) {
     switch (s) {
@@ -231,6 +280,18 @@ void MainWindow::setupMenuBar() {
     QMenu* fileMenu = menuBar->addMenu("&File");
     QAction* configAction = fileMenu->addAction("&Configurazione Camere...", this, &MainWindow::openCameraConfig);
     configAction->setShortcut(QKeySequence::Preferences);
+    QAction* autostartAction = fileMenu->addAction("Avvia &automaticamente all'accesso");
+    autostartAction->setCheckable(true);
+    autostartAction->setChecked(QFile::exists(autostartFilePath()));
+    autostartAction->setToolTip("Avvia OmniGuard al login e lo riavvia se si chiude per un errore");
+    connect(autostartAction, &QAction::toggled, this, [this, autostartAction](bool on) {
+        if (!setAutostart(on, m_configManager->configPath())) {
+            QMessageBox::warning(this, "Avvio automatico",
+                                 "Impossibile modificare il file:\n" + autostartFilePath());
+            const QSignalBlocker blocker(autostartAction);
+            autostartAction->setChecked(!on);
+        }
+    });
     fileMenu->addSeparator();
     QAction* quitAction = fileMenu->addAction("&Esci", this, &QWidget::close);
     quitAction->setShortcut(QKeySequence::Quit);

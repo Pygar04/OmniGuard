@@ -84,6 +84,28 @@ sudo make install
 ./OmniGuard --help
 ```
 
+## Pacchetto .deb (menu applicazioni)
+
+Per installare OmniGuard come una normale applicazione (icona nel menu, avvio con un clic):
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+cd build && cpack                      # genera omniguard_<versione>_amd64.deb
+sudo apt install ./omniguard_*.deb     # installa anche le dipendenze Qt6/FFmpeg
+```
+
+Disinstallazione: `sudo apt remove omniguard`
+
+> Il `.deb` dipende dalle versioni di Qt6/FFmpeg della distribuzione su cui viene compilato:
+> generalo sulla stessa versione di Ubuntu/Debian del PC di destinazione.
+
+### Avvio automatico 24/7
+
+Dal menu **File → Avvia automaticamente all'accesso** OmniGuard viene avviato al login
+(`~/.config/autostart/omniguard.desktop`) tramite `omniguard-watchdog`, che lo
+**riavvia automaticamente in caso di crash**. La chiusura normale (menu *Esci*) non lo riavvia.
+
 ## Configurazione
 
 Il file di configurazione predefinito si trova in:

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=OmniGuard
+GenericName=Videosorveglianza
+Comment=Monitoraggio in tempo reale di 3 telecamere IP (RTSP)
+Exec=OmniGuard
+Icon=omniguard
+Terminal=false
+Categories=AudioVideo;Video;Player;Security;Qt;
+Keywords=telecamere;camera;rtsp;sorveglianza;cctv;zosi;
+StartupNotify=true
+StartupWMClass=OmniGuard

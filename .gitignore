@@ -72,3 +72,6 @@ vcpkg_installed/
 *.tmp
 *.temp
 cache/
+# Pacchetti generati
+*.deb
+_CPack_Packages/
