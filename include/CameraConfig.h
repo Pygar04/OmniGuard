@@ -38,6 +38,9 @@ public:
     // Configuration file path
     static QString defaultConfigPath();
     
+    // Percorso effettivo in uso (quello passato con -c, altrimenti il default)
+    QString configPath() const;
+    
 signals:
     void configChanged(int cameraId, const CameraConfig& config);
     void configLoaded();

@@ -6,9 +6,10 @@
 #include <QThread>
 #include <QMutex>
 #include <QWaitCondition>
+#include <QImage>
+#include <QSize>
 #include <atomic>
 #include <memory>
-#include <functional>
 
 // Forward declare FFmpeg types
 struct AVFormatContext;
@@ -17,124 +18,155 @@ struct AVCodec;
 struct AVFrame;
 struct AVPacket;
 struct SwsContext;
-struct AVBufferRef;
+struct AVDictionary;
 
+// Risultato di un test di connessione (usato dal dialog di configurazione)
+struct ProbeResult {
+    bool ok = false;
+    QString message;    // descrizione errore oppure "H264 1920x1080 @ 25 fps"
+};
+
+// ============================================================================
+// StreamWorker
+//
+// Modello di threading:
+//  - L'oggetto StreamWorker vive nel thread GUI (NON viene spostato con
+//    moveToThread). Possiede un QThread che esegue run() in loop.
+//  - Il thread worker comunica con la GUI solo tramite:
+//      * atomics (stato, contatori, flag di stop/reconnect)
+//      * una "casella" con l'ultimo frame (m_frameMutex): la GUI prende sempre
+//        il frame più recente, i frame vecchi vengono sovrascritti. La coda
+//        eventi Qt contiene al massimo UN evento frame per camera, quindi non
+//        può mai crescere e la GUI non può restare indietro.
+//      * segnali emessi in QueuedConnection.
+//  - Ogni chiamata FFmpeg bloccante (open, read) è interrompibile tramite
+//    interrupt_callback con scadenza: un RTSP che si "pianta" non blocca mai
+//    il thread e stop() termina sempre in tempi brevi.
+// ============================================================================
 class StreamWorker : public QObject {
     Q_OBJECT
 public:
     explicit StreamWorker(const CameraConfig& config, QObject* parent = nullptr);
     ~StreamWorker() override;
-    
-    // Non-copyable, movable
+
     StreamWorker(const StreamWorker&) = delete;
     StreamWorker& operator=(const StreamWorker&) = delete;
-    StreamWorker(StreamWorker&&) = delete;
-    StreamWorker& operator=(StreamWorker&&) = delete;
-    
-    // Start the worker thread
+
+    // Avvia il thread di acquisizione
     void start();
-    
-    // Stop the worker thread gracefully
+
+    // Chiede l'arresto (non bloccante) e attende la fine del thread (bloccante, max qualche centinaio di ms)
     void stop();
-    
-    // Check if worker is running
+    void requestStop();
+    bool wait(unsigned long ms);
+
     bool isRunning() const { return m_running.load(std::memory_order_acquire); }
-    
-    // Get camera ID
-    int cameraId() const { return m_config.id; }
-    
-    // Get current state (thread-safe)
+    int cameraId() const { return m_cameraId; }
     CameraState getState() const { return m_state.load(std::memory_order_acquire); }
-    
-    // Get status snapshot (thread-safe copy)
     CameraStatus getStatus() const;
-    
-    // Force reconnection attempt
+
     void requestReconnect();
 
+    // Thread-safe: la nuova configurazione viene applicata dal thread worker alla prossima iterazione
+    void updateConfig(const CameraConfig& config);
+
+    // Thread-safe: dimensione (in pixel fisici) in cui la GUI disegnerà il video.
+    // Il worker ridimensiona direttamente in sws_scale: la GUI non deve più scalare nulla.
+    void setTargetSize(const QSize& size);
+
+    // Chiamato dalla GUI dopo frameAvailable(): restituisce l'ultimo frame (può essere nullo)
+    QImage takeLatestFrame();
+
+    // Test di connessione sincrono (da chiamare in un thread secondario!).
+    // 'cancel' può essere impostato da un altro thread per interrompere subito.
+    static ProbeResult probe(const CameraConfig& config, const std::atomic<bool>* cancel);
+
 signals:
-    // Emitted when a new frame is decoded and ready for display
-    // Uses Qt::QueuedConnection for thread safety
-    void frameReady(FrameData frame);
-    
-    // Emitted when camera state changes
+    // Esiste un nuovo frame da prendere con takeLatestFrame()
+    void frameAvailable(int cameraId);
     void stateChanged(CameraState newState);
-    
-    // Emitted on error (non-fatal)
     void errorOccurred(const QString& message);
-    
-    // Emitted when connection is established
     void connected();
-    
-    // Emitted when connection is lost
     void disconnected(const QString& reason);
 
 private:
-    // Main worker loop
     void run();
-    
-    // Connection and streaming
+
     bool openStream();
     void closeStream();
-    bool reconnect();
-    
-    // Frame processing
-    bool decodeFrame();
-    bool processFrame(AVFrame* frame);
-    QImage convertFrame(AVFrame* frame);
-    
-    // FFmpeg initialization
-    bool initFFmpeg();
-    void cleanupFFmpeg();
-    
-    // Timeout handling
-    bool waitForData(int timeoutMs);
-    
-    // Configuration
+
+    // Legge un pacchetto e lo decodifica. Ritorna false se la connessione va ricreata.
+    bool readAndDecode();
+    void handleDecodedFrame(AVFrame* frame);
+
+    void configureCodecContext(const AVCodec* codec, bool useVaapiDevice);
+    AVDictionary* createFormatOptions() const;
+
+    void setState(CameraState newState);
+    void setLastError(const QString& err);
+    void reportError(const QString& err);   // emette errorOccurred con rate limit
+
+    // Interrupt callback FFmpeg
+    static int interruptCallback(void* opaque);
+    void armDeadline(int timeoutMs);
+    void disarmDeadline();
+
+    bool waitInterruptible(int ms);  // ritorna false se è stato chiesto lo stop
+    void applyPendingConfig();
+
+    const int m_cameraId;
+
+    // Configurazione: m_config è usata SOLO dal thread worker.
+    // La GUI scrive m_pendingConfig sotto mutex.
     CameraConfig m_config;
-    
+    QMutex m_configMutex;
+    std::unique_ptr<CameraConfig> m_pendingConfig;
+    std::atomic<bool> m_hasPendingConfig{false};
+
     // Thread control
+    std::unique_ptr<QThread> m_thread;
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_stopRequested{false};
-    std::unique_ptr<QThread> m_thread;
-    std::unique_ptr<QMutex> m_mutex;
-    std::unique_ptr<QWaitCondition> m_waitCondition;
-    
-    // FFmpeg contexts (owned by this worker)
+    std::atomic<bool> m_reconnectRequested{false};
+    QMutex m_waitMutex;
+    QWaitCondition m_waitCondition;
+
+    // Scadenza per l'operazione FFmpeg in corso (ns steady clock, 0 = nessuna)
+    std::atomic<int64_t> m_deadlineNs{0};
+
+    // FFmpeg (solo thread worker)
     AVFormatContext* m_formatCtx = nullptr;
     AVCodecContext* m_codecCtx = nullptr;
-    AVCodec* m_codec = nullptr;
     AVFrame* m_frame = nullptr;
-    AVFrame* m_frameRGB = nullptr;
+    AVFrame* m_swFrame = nullptr;     // per i frame scaricati dalla GPU (VAAPI)
     AVPacket* m_packet = nullptr;
     SwsContext* m_swsCtx = nullptr;
-    uint8_t* m_rgbBuffer = nullptr;
-    int m_rgbBufferSize = 0;
     int m_videoStreamIndex = -1;
-    
-    // Frame counter
-    std::atomic<uint32_t> m_frameCounter{0};
-    
-    // Status tracking (atomic for thread-safe access)
+    int m_decodeErrorsInRow = 0;
+    int64_t m_lastFrameNs = 0;        // ultimo frame decodificato (steady clock)
+    int64_t m_lastEmitNs = 0;         // ultimo frame consegnato alla GUI
+
+    // Dimensione desiderata dalla GUI (w << 32 | h)
+    std::atomic<uint64_t> m_targetSize{0};
+
+    // Casella "ultimo frame"
+    QMutex m_frameMutex;
+    QImage m_latestFrame;
+    std::atomic<bool> m_frameNotifyPending{false};
+
+    // Status (letto dalla GUI)
     std::atomic<CameraState> m_state{CameraState::Disconnected};
     std::atomic<int> m_consecutiveFailures{0};
     std::atomic<uint64_t> m_totalFrames{0};
+    std::atomic<uint64_t> m_displayedFrames{0};
     std::atomic<uint64_t> m_droppedFrames{0};
     std::atomic<qint64> m_lastFrameTime{0};
+    mutable QMutex m_errorMutex;
     QString m_lastError;
-    
-    // Reconnection state
-    std::atomic<bool> m_reconnectRequested{false};
-    
-    // Helper: set state and emit signal
-    void setState(CameraState newState);
-    
-    // Helper: build RTSP URL with credentials
-    QString buildRtspUrl() const;
-    
-    // Helper: configure FFmpeg options
-    void configureFormatContext();
-    void configureCodecContext();
+
+    // Rate limit errori verso GUI/log
+    QString m_lastReportedError;
+    int64_t m_lastReportNs = 0;
 };
 
 #endif // OMNIGUARD_STREAM_WORKER_H

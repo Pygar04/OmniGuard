@@ -7,6 +7,7 @@
 #include <QGridLayout>
 #include <QWidget>
 #include <QTimer>
+#include <QElapsedTimer>
 #include <QStatusBar>
 #include <QMenuBar>
 #include <QAction>
@@ -22,21 +23,34 @@
 #include <QTabWidget>
 #include <QPushButton>
 #include <array>
+#include <atomic>
 #include <memory>
 
 class StreamWorker;
 class CameraConfigManager;
+struct ProbeResult;
 
+// ============================================================================
+// VideoWidget - riquadro di una telecamera
+// Riceve frame già ridimensionati dal thread della camera: il paint è un semplice blit.
+// ============================================================================
 class VideoWidget : public QWidget {
     Q_OBJECT
 public:
     explicit VideoWidget(int cameraId, const QString& name, QWidget* parent = nullptr);
-    
+
     void setImage(const QImage& image);
     void setState(CameraState state);
     void setError(const QString& error);
-    
+    void setName(const QString& name);
+    void setStale(bool stale);
+
     int cameraId() const { return m_cameraId; }
+    qint64 msSinceLastFrame() const;
+
+signals:
+    // Dimensione in pixel fisici in cui il video verrà disegnato
+    void targetSizeChanged(const QSize& size);
 
 protected:
     void paintEvent(QPaintEvent* event) override;
@@ -48,20 +62,22 @@ private:
     QImage m_currentFrame;
     CameraState m_state = CameraState::Disconnected;
     QString m_errorText;
-    QPixmap m_scaledPixmap;
-    bool m_needsRescale = true;
+    bool m_stale = false;
+    QElapsedTimer m_lastFrameTimer;
+    QString m_lastFrameClock;
+    QFont m_titleFont;
+    QFont m_smallFont;
 };
 
 // ============================================================================
-// CameraConfigDialog - Dialog per configurazione camere
+// CameraConfigDialog - configurazione telecamere
 // ============================================================================
 class CameraConfigDialog : public QDialog {
     Q_OBJECT
 public:
     explicit CameraConfigDialog(CameraConfigManager* configManager, QWidget* parent = nullptr);
-    ~CameraConfigDialog() override = default;
-    
-    // Non-copyable
+    ~CameraConfigDialog() override;
+
     CameraConfigDialog(const CameraConfigDialog&) = delete;
     CameraConfigDialog& operator=(const CameraConfigDialog&) = delete;
 
@@ -70,53 +86,58 @@ signals:
 
 private slots:
     void onSave();
-    void onCancel();
     void onTestConnection(int cameraId);
-    void onUseSubStreamChanged(int cameraId, bool enabled);
 
 private:
-    void setupUI();
-    void loadConfig();
-    void saveConfig();
-    void updateSubStreamFields(int cameraId, bool enabled);
-    
-    CameraConfigManager* m_configManager = nullptr;
-    
-    // Per ogni camera: tab con campi
     struct CameraTab {
-        QWidget* widget = nullptr;
+        QWidget* page = nullptr;
         QLineEdit* nameEdit = nullptr;
         QLineEdit* rtspUrlEdit = nullptr;
+        QLineEdit* subStreamUrlEdit = nullptr;
+        QComboBox* streamTypeCombo = nullptr;
         QLineEdit* usernameEdit = nullptr;
         QLineEdit* passwordEdit = nullptr;
-        QLineEdit* subStreamUrlEdit = nullptr;
-        QCheckBox* useSubStreamCheck = nullptr;
+        QCheckBox* showPasswordCheck = nullptr;
+        QSpinBox* fpsSpin = nullptr;
+        QCheckBox* lowCpuCheck = nullptr;
+        QCheckBox* enableHwAccelCheck = nullptr;
+        QComboBox* hwAccelTypeCombo = nullptr;
+        QCheckBox* enableTcpCheck = nullptr;
+        QCheckBox* enableBufferingCheck = nullptr;
         QSpinBox* reconnectIntervalSpin = nullptr;
         QSpinBox* connectionTimeoutSpin = nullptr;
         QSpinBox* receiveTimeoutSpin = nullptr;
-        QSpinBox* widthSpin = nullptr;
-        QSpinBox* heightSpin = nullptr;
-        QSpinBox* fpsSpin = nullptr;
-        QCheckBox* enableTcpCheck = nullptr;
-        QCheckBox* enableBufferingCheck = nullptr;
-        QCheckBox* enableHwAccelCheck = nullptr;
-        QComboBox* hwAccelTypeCombo = nullptr;
         QPushButton* testBtn = nullptr;
         QLabel* testStatusLabel = nullptr;
+        QLabel* validationLabel = nullptr;
     };
+
+    void setupUI();
+    QWidget* buildCameraPage(int i);
+    void loadConfig();
+    CameraConfig configFromTab(int i) const;
+    bool validateTab(int i);
+    void markInvalid(QWidget* w, bool invalid);
+    void onTestFinished(int cameraId, const ProbeResult& result);
+
+    CameraConfigManager* m_configManager = nullptr;
     std::array<CameraTab, 3> m_cameraTabs;
-    
     QTabWidget* m_tabWidget = nullptr;
     QDialogButtonBox* m_buttonBox = nullptr;
+
+    // Impostato alla chiusura del dialog: interrompe subito eventuali test in corso
+    std::shared_ptr<std::atomic<bool>> m_testCancel;
 };
 
+// ============================================================================
+// MainWindow
+// ============================================================================
 class MainWindow : public QMainWindow {
     Q_OBJECT
 public:
     explicit MainWindow(CameraConfigManager* configManager, QWidget* parent = nullptr);
     ~MainWindow() override;
-    
-    // Non-copyable
+
     MainWindow(const MainWindow&) = delete;
     MainWindow& operator=(const MainWindow&) = delete;
 
@@ -124,15 +145,12 @@ protected:
     void closeEvent(QCloseEvent* event) override;
 
 private slots:
-    void onFrameReady(FrameData frame);
+    void onFrameAvailable(int cameraId);
     void onStateChanged(int cameraId, CameraState state);
     void onErrorOccurred(int cameraId, const QString& error);
-    void onConnected(int cameraId);
-    void onDisconnected(int cameraId, const QString& reason);
     void updateStatusBar();
     void onConfigChanged(int cameraId, const CameraConfig& config);
     void openCameraConfig();
-    void onConfigDialogSaved();
 
 private:
     void setupUI();
@@ -142,28 +160,24 @@ private:
     void startWorkers();
     void stopWorkers();
     void applyConfig(const CameraConfig& config);
-    
+
     CameraConfigManager* m_configManager = nullptr;
-    
-    // Central widget and layout
+
     QWidget* m_centralWidget = nullptr;
     QGridLayout* m_gridLayout = nullptr;
-    
-    // Video widgets (one per camera)
+
     std::array<std::unique_ptr<VideoWidget>, 3> m_videoWidgets;
-    
-    // Workers (one per camera)
     std::array<std::unique_ptr<StreamWorker>, 3> m_workers;
-    
-    // Status bar
+
     QStatusBar* m_statusBar = nullptr;
     QLabel* m_statusLabels[3] = {nullptr, nullptr, nullptr};
-    QLabel* m_fpsLabel = nullptr;
+    QLabel* m_uptimeLabel = nullptr;
     QTimer* m_statusTimer = nullptr;
-    
-    // Performance tracking
-    std::array<uint64_t, 3> m_lastFrameCounts{0, 0, 0};
-    std::array<double, 3> m_currentFps{0.0, 0.0, 0.0};
+    QElapsedTimer m_uptime;
+    QElapsedTimer m_fpsTimer;
+
+    std::array<uint64_t, 3> m_lastDisplayedCounts{0, 0, 0};
+    bool m_workersStopped = false;
 };
 
 #endif // OMNIGUARD_MAIN_WINDOW_H

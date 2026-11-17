@@ -3,7 +3,7 @@
         {
             "id": 0,
             "name": "Camera 1 - Ingresso",
-            "rtspUrl": "rtsp://melnyknadiya82@gmail.com:Sicurezza3007@192.168.1.12:554/video1",
+            "rtspUrl": "rtsp://utente:password@192.168.1.12:554/video1",
             "username": "",
             "password": "",
             "reconnectIntervalMs": 3000,
@@ -15,7 +15,7 @@
         {
             "id": 1,
             "name": "Camera 2 - Giardino",
-            "rtspUrl": "rtsp://melnyknadiya82@gmail.com:Sicurezza3007@192.168.1.13:554/video1",
+            "rtspUrl": "rtsp://utente:password@192.168.1.13:554/video1",
             "username": "",
             "password": "",
             "reconnectIntervalMs": 3000,
@@ -27,7 +27,7 @@
         {
             "id": 2,
             "name": "Camera 3 - Garage",
-            "rtspUrl": "rtsp://melnyknadiya82@gmail.com:Sicurezza3007@192.168.1.14:554/video1",
+            "rtspUrl": "rtsp://utente:password@192.168.1.14:554/video1",
             "username": "",
             "password": "",
             "reconnectIntervalMs": 3000,

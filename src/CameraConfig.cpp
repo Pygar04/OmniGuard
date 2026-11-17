@@ -2,6 +2,7 @@
 #include <QStandardPaths>
 #include <QDir>
 #include <QDebug>
+#include <QSaveFile>
 
 CameraConfigManager::CameraConfigManager(QObject* parent)
     : QObject(parent) {
@@ -78,7 +79,9 @@ bool CameraConfigManager::saveToFile(const QString& filePath) {
     root["version"] = 1;
     
     QJsonDocument doc(root);
-    QFile file(filePath);
+    // QSaveFile: scrittura atomica (file temporaneo + rename). Se manca la corrente
+    // durante il salvataggio il vecchio cameras.json resta integro.
+    QSaveFile file(filePath);
     
     if (!file.open(QIODevice::WriteOnly)) {
         QString err = QString("Cannot write config file: %1").arg(file.errorString());
@@ -88,7 +91,13 @@ bool CameraConfigManager::saveToFile(const QString& filePath) {
     }
     
     file.write(doc.toJson(QJsonDocument::Indented));
-    file.close();
+    if (!file.commit()) {
+        QString err = QString("Cannot write config file: %1").arg(file.errorString());
+        qWarning() << err;
+        emit errorOccurred(err);
+        return false;
+    }
+    m_configPath = filePath;
     
     emit configSaved();
     return true;
@@ -107,6 +116,9 @@ std::array<std::optional<CameraConfig>, 3> CameraConfigManager::getAllConfigs() 
 
 bool CameraConfigManager::updateConfig(const CameraConfig& config) {
     if (config.id >= 0 && config.id < 3) {
+        if (m_configs[config.id].has_value() && m_configs[config.id].value() == config) {
+            return true;  // nessuna modifica: non far riconnettere la camera
+        }
         m_configs[config.id] = config;
         emit configChanged(config.id, config);
         return true;
@@ -138,6 +150,10 @@ std::array<CameraConfig, 3> CameraConfigManager::createDefaults() {
     return defaults;
 }
 
+QString CameraConfigManager::configPath() const {
+    return m_configPath.isEmpty() ? defaultConfigPath() : m_configPath;
+}
+
 QString CameraConfigManager::defaultConfigPath() {
     QString configDir = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
     QDir dir(configDir);
@@ -162,6 +178,7 @@ void CameraConfigManager::parseConfig(const QJsonObject& obj, CameraConfig& conf
     config.useSubStream = obj["useSubStream"].toBool(config.useSubStream);
     config.enableHwAccel = obj["enableHwAccel"].toBool(config.enableHwAccel);
     config.hwAccelType = obj["hwAccelType"].toString(config.hwAccelType);
+    config.lowCpuDecode = obj["lowCpuDecode"].toBool(config.lowCpuDecode);
     config.width = obj["width"].toInt(config.width);
     config.height = obj["height"].toInt(config.height);
     config.fps = obj["fps"].toInt(config.fps);
@@ -183,6 +200,7 @@ QJsonObject CameraConfigManager::toJson(const CameraConfig& config) const {
     obj["useSubStream"] = config.useSubStream;
     obj["enableHwAccel"] = config.enableHwAccel;
     obj["hwAccelType"] = config.hwAccelType;
+    obj["lowCpuDecode"] = config.lowCpuDecode;
     obj["width"] = config.width;
     obj["height"] = config.height;
     obj["fps"] = config.fps;

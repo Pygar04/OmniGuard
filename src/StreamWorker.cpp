@@ -1,64 +1,178 @@
 #include "StreamWorker.h"
-#include <QThread>
 #include <QDateTime>
 #include <QDebug>
 #include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <functional>
 
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/avutil.h>
+#include <libavutil/hwcontext.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
 #include <libavutil/error.h>
 #include <libswscale/swscale.h>
 }
 
+namespace {
+
+// Orologio monotono: non salta con NTP / cambio ora legale (fondamentale per 24/7)
+int64_t nowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+constexpr int64_t MS = 1'000'000;            // ns in 1 ms
+constexpr int64_t SEC = 1000 * MS;
+
+constexpr int64_t FORCED_RECONNECT_INTERVAL_NS = 6LL * 3600 * SEC;  // pulizia stato FFmpeg ogni 6h
+constexpr int64_t STATS_LOG_INTERVAL_NS = 3600 * SEC;
+constexpr int64_t ERROR_REPORT_INTERVAL_NS = 10 * SEC;
+constexpr int MAX_DECODE_ERRORS_IN_ROW = 150;      // ~6s di pacchetti corrotti a 25fps
+constexpr int CLOSE_TIMEOUT_MS = 2000;              // tempo massimo per il TEARDOWN RTSP
+
+QString avErrorString(int err) {
+    return FFmpegError::fromAvError(err).message;
+}
+
+// Thread semplice che esegue una funzione (riavviabile, a differenza di QThread::create)
+class FunctionThread : public QThread {
+public:
+    explicit FunctionThread(std::function<void()> fn) : m_fn(std::move(fn)) {}
+protected:
+    void run() override { m_fn(); }
+private:
+    std::function<void()> m_fn;
+};
+
+// Opzioni comuni a worker e test di connessione
+AVDictionary* buildFormatOptions(const CameraConfig& cfg) {
+    AVDictionary* opts = nullptr;
+
+    av_dict_set(&opts, "rtsp_transport", cfg.enableTcp ? "tcp" : "udp", 0);
+
+    // Timeout socket in microsecondi.
+    // FFmpeg >= 5 (libavformat 59) usa "timeout"; in FFmpeg 4.x "timeout" significava
+    // "attendi connessioni in ingresso" (modalità listen!) e si usava "stimeout".
+    const QByteArray sockTimeout = QByteArray::number(qint64(cfg.receiveTimeoutMs) * 1000);
+#if LIBAVFORMAT_VERSION_MAJOR >= 59
+    av_dict_set(&opts, "timeout", sockTimeout.constData(), 0);
+#else
+    av_dict_set(&opts, "stimeout", sockTimeout.constData(), 0);
+#endif
+
+    // Bassa latenza, scarta pacchetti corrotti
+    av_dict_set(&opts, "fflags", "nobuffer+discardcorrupt", 0);
+    av_dict_set(&opts, "reorder_queue_size", cfg.enableBuffering ? "64" : "16", 0);
+    av_dict_set(&opts, "max_delay", cfg.enableBuffering ? "500000" : "100000", 0);
+    av_dict_set(&opts, "buffer_size", cfg.enableBuffering ? "1048576" : "262144", 0);
+
+    // Solo video: niente audio da ricevere/decodificare
+    av_dict_set(&opts, "allowed_media_types", "video", 0);
+    return opts;
+}
+
+struct ProbeInterrupt {
+    const std::atomic<bool>* cancel = nullptr;
+    int64_t deadlineNs = 0;
+};
+
+int probeInterruptCb(void* opaque) {
+    auto* p = static_cast<ProbeInterrupt*>(opaque);
+    if (p->cancel && p->cancel->load(std::memory_order_relaxed)) return 1;
+    return (p->deadlineNs != 0 && nowNs() > p->deadlineNs) ? 1 : 0;
+}
+
+} // namespace
+
+// ============================================================================
+// Lifecycle
+// ============================================================================
+
 StreamWorker::StreamWorker(const CameraConfig& config, QObject* parent)
     : QObject(parent)
+    , m_cameraId(config.id)
     , m_config(config)
-    , m_thread(std::make_unique<QThread>())
-    , m_mutex(std::make_unique<QMutex>())
-    , m_waitCondition(std::make_unique<QWaitCondition>()) {
-    
-    moveToThread(m_thread.get());
-    
-    connect(m_thread.get(), &QThread::started, this, &StreamWorker::run);
-    connect(m_thread.get(), &QThread::finished, this, &QObject::deleteLater);
-    
-    qRegisterMetaType<FrameData>("FrameData");
+    , m_thread(std::make_unique<FunctionThread>([this] { run(); })) {
+    m_thread->setObjectName(QString("cam%1").arg(m_cameraId));
     qRegisterMetaType<CameraState>("CameraState");
 }
 
 StreamWorker::~StreamWorker() {
     stop();
-    if (m_thread->isRunning()) {
-        m_thread->wait(5000);
-    }
-    cleanupFFmpeg();
+    closeStream();  // nel caso il thread non fosse mai partito
 }
 
 void StreamWorker::start() {
-    if (m_running.load(std::memory_order_acquire)) {
-        qWarning() << "Worker already running for camera" << m_config.id;
+    if (m_thread->isRunning()) {
+        qWarning() << "Worker already running for camera" << m_cameraId;
         return;
     }
-    
     m_stopRequested.store(false, std::memory_order_release);
+    m_reconnectRequested.store(false, std::memory_order_release);
     m_running.store(true, std::memory_order_release);
     m_thread->start(QThread::NormalPriority);
 }
 
-void StreamWorker::stop() {
+void StreamWorker::requestStop() {
+    QMutexLocker locker(&m_waitMutex);
     m_stopRequested.store(true, std::memory_order_release);
-    m_running.store(false, std::memory_order_release);
-    m_reconnectRequested.store(true, std::memory_order_release);
-    m_waitCondition->wakeAll();
+    m_waitCondition.wakeAll();
+}
+
+void StreamWorker::stop() {
+    requestStop();
+    // Tutte le chiamate FFmpeg bloccanti sono interrompibili: il thread esce in pochi ms.
+    if (m_thread->isRunning()) {
+        m_thread->wait();
+    }
+}
+
+bool StreamWorker::wait(unsigned long ms) {
+    return m_thread->wait(QDeadlineTimer(qint64(ms)));
 }
 
 void StreamWorker::requestReconnect() {
+    QMutexLocker locker(&m_waitMutex);
     m_reconnectRequested.store(true, std::memory_order_release);
-    m_waitCondition->wakeAll();
+    m_waitCondition.wakeAll();
+}
+
+void StreamWorker::updateConfig(const CameraConfig& config) {
+    if (config.id != m_cameraId) return;
+    {
+        QMutexLocker locker(&m_configMutex);
+        m_pendingConfig = std::make_unique<CameraConfig>(config);
+        m_hasPendingConfig.store(true, std::memory_order_release);
+    }
+    requestReconnect();
+}
+
+void StreamWorker::applyPendingConfig() {
+    if (!m_hasPendingConfig.load(std::memory_order_acquire)) return;
+    QMutexLocker locker(&m_configMutex);
+    if (m_pendingConfig) {
+        m_config = *m_pendingConfig;
+        m_pendingConfig.reset();
+    }
+    m_hasPendingConfig.store(false, std::memory_order_release);
+}
+
+void StreamWorker::setTargetSize(const QSize& size) {
+    const uint64_t w = uint64_t(std::max(0, size.width()));
+    const uint64_t h = uint64_t(std::max(0, size.height()));
+    m_targetSize.store((w << 32) | h, std::memory_order_relaxed);
+}
+
+QImage StreamWorker::takeLatestFrame() {
+    QMutexLocker locker(&m_frameMutex);
+    QImage img = std::move(m_latestFrame);
+    m_latestFrame = QImage();
+    m_frameNotifyPending.store(false, std::memory_order_release);
+    return img;
 }
 
 CameraStatus StreamWorker::getStatus() const {
@@ -66,537 +180,523 @@ CameraStatus StreamWorker::getStatus() const {
     status.state = m_state.load(std::memory_order_acquire);
     status.consecutiveFailures = m_consecutiveFailures.load(std::memory_order_relaxed);
     status.totalFrames = m_totalFrames.load(std::memory_order_relaxed);
+    status.displayedFrames = m_displayedFrames.load(std::memory_order_relaxed);
     status.droppedFrames = m_droppedFrames.load(std::memory_order_relaxed);
     status.lastFrameTime = m_lastFrameTime.load(std::memory_order_relaxed);
+    QMutexLocker locker(&m_errorMutex);
     status.lastError = m_lastError;
     return status;
 }
 
+// ============================================================================
+// Main loop (thread worker)
+// ============================================================================
+
 void StreamWorker::run() {
-    qInfo() << "Stream worker started for camera" << m_config.id << "(" << m_config.name << ")";
-    
-    if (!initFFmpeg()) {
-        setState(CameraState::Error);
-        emit errorOccurred("Failed to initialize FFmpeg");
-        m_running.store(false, std::memory_order_release);
-        return;
-    }
-    
-    // === LONG-RUNNING PROTECTIONS ===
-    // Watchdog: timestamp ultimo frame ricevuto con successo
-    qint64 lastSuccessfulFrameTime = QDateTime::currentMSecsSinceEpoch();
-    constexpr qint64 WATCHDOG_TIMEOUT_MS = 15000;  // 15 secondi senza frame = force reconnect
-    
-    // Forced periodic reconnect: ogni 6 ore ricrea connessione per pulire stato FFmpeg
-    constexpr qint64 FORCED_RECONNECT_INTERVAL_MS = 6 * 60 * 60 * 1000;  // 6 ore
-    qint64 connectionStartTime = QDateTime::currentMSecsSinceEpoch();
-    
-    // Statistiche periodiche (ogni ora)
-    constexpr qint64 STATS_LOG_INTERVAL_MS = 60 * 60 * 1000;  // 1 ora
-    qint64 lastStatsLogTime = QDateTime::currentMSecsSinceEpoch();
-    
-    // Backpressure
-    int framesSinceLastCheck = 0;
-    
+    qInfo() << "Stream worker started for camera" << m_cameraId;
+
     while (!m_stopRequested.load(std::memory_order_acquire)) {
+        applyPendingConfig();
+        m_reconnectRequested.store(false, std::memory_order_release);
+
         setState(CameraState::Connecting);
-        
+        bool reconnectImmediately = false;
+
         if (openStream()) {
             setState(CameraState::Connected);
             m_consecutiveFailures.store(0, std::memory_order_relaxed);
-            lastSuccessfulFrameTime = QDateTime::currentMSecsSinceEpoch();
-            connectionStartTime = QDateTime::currentMSecsSinceEpoch();
-            lastStatsLogTime = QDateTime::currentMSecsSinceEpoch();
-            framesSinceLastCheck = 0;
+            setLastError(QString());
             emit connected();
-            
-            while (!m_stopRequested.load(std::memory_order_acquire) && 
+
+            const int64_t connectionStart = nowNs();
+            int64_t lastStatsLog = connectionStart;
+            m_lastFrameNs = connectionStart;
+            m_lastEmitNs = 0;
+            m_decodeErrorsInRow = 0;
+            const int64_t watchdogNs = std::max<int64_t>(15 * SEC, 2LL * m_config.receiveTimeoutMs * MS);
+            QString reason;
+
+            while (!m_stopRequested.load(std::memory_order_acquire) &&
                    !m_reconnectRequested.load(std::memory_order_acquire)) {
-                
-                if (!decodeFrame()) {
-                    if (m_stopRequested.load(std::memory_order_acquire)) break;
-                    
-                    m_consecutiveFailures.fetch_add(1, std::memory_order_relaxed);
-                    m_droppedFrames.fetch_add(1, std::memory_order_relaxed);
-                    
-                    QString err = QString("Frame decode failed (failures: %1)").arg(m_consecutiveFailures.load());
-                    emit errorOccurred(err);
-                    
-                    if (m_consecutiveFailures.load() >= 10) {
-                        qWarning() << "Too many decode failures, forcing reconnect for camera" << m_config.id;
-                        break;
-                    }
-                    
-                    QThread::msleep(100);
-                    continue;
-                }
-                
-                // Frame decodificato con successo - aggiorna watchdog
-                lastSuccessfulFrameTime = QDateTime::currentMSecsSinceEpoch();
-                
-                m_totalFrames.fetch_add(1, std::memory_order_relaxed);
-                m_frameCounter.fetch_add(1, std::memory_order_relaxed);
-                m_lastFrameTime.store(lastSuccessfulFrameTime, std::memory_order_relaxed);
-                
-                // BACKPRESSURE: ogni 30 frame yield per non saturare coda eventi
-                framesSinceLastCheck++;
-                if (framesSinceLastCheck >= 30) {
-                    framesSinceLastCheck = 0;
-                    QThread::yieldCurrentThread();
-                }
-                
-                // === CONTROLLI PERIODICI (ogni frame) ===
-                qint64 now = QDateTime::currentMSecsSinceEpoch();
-                
-                // 1. WATCHDOG: se nessun frame per troppo tempo, forza reconnect
-                if (now - lastSuccessfulFrameTime > WATCHDOG_TIMEOUT_MS) {
-                    qWarning() << "Watchdog timeout (" << WATCHDOG_TIMEOUT_MS << "ms) - no frames for camera" << m_config.id << "- forcing reconnect";
-                    m_lastError = QString("Watchdog timeout: no frames for %1ms").arg(WATCHDOG_TIMEOUT_MS);
+
+                if (!readAndDecode()) {
+                    QMutexLocker locker(&m_errorMutex);
+                    reason = m_lastError;
                     break;
                 }
-                
-                // 2. FORCED RECONNECT: ogni 6 ore ricrea connessione (pulizia stato FFmpeg)
-                if (now - connectionStartTime > FORCED_RECONNECT_INTERVAL_MS) {
-                    qInfo() << "Periodic reconnect (6h) for camera" << m_config.id << "- refreshing FFmpeg state";
-                    m_lastError = "Periodic maintenance reconnect";
+
+                const int64_t now = nowNs();
+
+                // WATCHDOG: arrivano pacchetti ma nessun frame decodificabile
+                if (now - m_lastFrameNs > watchdogNs) {
+                    reason = QString("Nessun frame valido da %1 s").arg(watchdogNs / SEC);
+                    qWarning() << "Camera" << m_cameraId << "watchdog:" << reason;
+                    setLastError(reason);
                     break;
                 }
-                
-                // 3. STATS LOG: ogni ora logga statistiche per debug
-                if (now - lastStatsLogTime > STATS_LOG_INTERVAL_MS) {
-                    lastStatsLogTime = now;
-                    uint64_t total = m_totalFrames.load(std::memory_order_relaxed);
-                    uint64_t dropped = m_droppedFrames.load(std::memory_order_relaxed);
-                    int failures = m_consecutiveFailures.load(std::memory_order_relaxed);
-                    qint64 uptimeSec = (now - connectionStartTime) / 1000;
-                    double avgFps = uptimeSec > 0 ? (double)total / uptimeSec : 0;
-                    double dropRate = total > 0 ? (double)dropped / total * 100 : 0;
-                    
-                    qInfo() << QString("Camera %1 stats: uptime=%2h frames=%3 dropped=%4 (%.1f%%) fps=%.1f failures=%5")
-                        .arg(m_config.id)
-                        .arg(uptimeSec / 3600)
-                        .arg(total)
-                        .arg(dropped)
-                        .arg(dropRate)
-                        .arg(avgFps)
-                        .arg(failures);
+
+                if (now - connectionStart > FORCED_RECONNECT_INTERVAL_NS) {
+                    qInfo() << "Camera" << m_cameraId << "periodic reconnect (6h)";
+                    reason = "Riconnessione periodica di manutenzione";
+                    reconnectImmediately = true;
+                    break;
+                }
+
+                if (now - lastStatsLog > STATS_LOG_INTERVAL_NS) {
+                    lastStatsLog = now;
+                    qInfo().noquote() << QString("Camera %1 stats: uptime=%2h decoded=%3 displayed=%4 dropped=%5")
+                        .arg(m_cameraId)
+                        .arg((now - connectionStart) / (3600 * SEC))
+                        .arg(m_totalFrames.load())
+                        .arg(m_displayedFrames.load())
+                        .arg(m_droppedFrames.load());
                 }
             }
-            
+
+            if (m_reconnectRequested.load(std::memory_order_acquire)) {
+                reason = "Riconnessione richiesta (configurazione cambiata)";
+                reconnectImmediately = true;
+            }
+
             closeStream();
-            
-            if (m_stopRequested.load(std::memory_order_acquire)) {
-                break;
-            }
-            
-            m_reconnectRequested.store(false, std::memory_order_release);
-            emit disconnected("Connection lost or reconnect requested");
+            if (m_stopRequested.load(std::memory_order_acquire)) break;
+            emit disconnected(reason.isEmpty() ? QString("Connessione persa") : reason);
         } else {
-            m_consecutiveFailures.fetch_add(1, std::memory_order_relaxed);
-            setState(CameraState::Reconnecting);
-            
-            QString err = QString("Connection failed (attempt %1): %2").arg(m_consecutiveFailures.load()).arg(m_lastError);
-            emit errorOccurred(err);
-        }
-        
-        if (!m_stopRequested.load(std::memory_order_acquire)) {
-            setState(CameraState::Reconnecting);
-            int waitTime = m_config.reconnectIntervalMs;
-            
-            int failures = m_consecutiveFailures.load();
-            if (failures > 5) {
-                waitTime = std::min(waitTime * (1 << std::min(failures - 5, 5)), 60000);
+            closeStream();
+            if (m_stopRequested.load(std::memory_order_acquire)) break;
+            if (m_reconnectRequested.load(std::memory_order_acquire)) continue;  // config cambiata durante l'apertura
+
+            const int failures = m_consecutiveFailures.fetch_add(1, std::memory_order_relaxed) + 1;
+            QString err;
+            {
+                QMutexLocker locker(&m_errorMutex);
+                err = m_lastError;
             }
-            
-            QMutexLocker locker(m_mutex.get());
-            m_waitCondition->wait(m_mutex.get(), waitTime);
+            reportError(QString("Connessione fallita (tentativo %1): %2").arg(failures).arg(err));
         }
+
+        if (m_stopRequested.load(std::memory_order_acquire)) break;
+        if (reconnectImmediately) continue;
+
+        setState(CameraState::Reconnecting);
+
+        // Backoff esponenziale dopo 5 fallimenti, max 60s
+        int waitTime = std::max(500, m_config.reconnectIntervalMs);
+        const int failures = m_consecutiveFailures.load(std::memory_order_relaxed);
+        if (failures > 5) {
+            waitTime = std::min(waitTime * (1 << std::min(failures - 5, 5)), 60000);
+        }
+        if (!waitInterruptible(waitTime)) break;
     }
-    
+
     closeStream();
-    cleanupFFmpeg();
     m_running.store(false, std::memory_order_release);
     setState(CameraState::Disconnected);
-    
-    qInfo() << "Stream worker stopped for camera" << m_config.id;
+    qInfo() << "Stream worker stopped for camera" << m_cameraId;
 }
 
-bool StreamWorker::initFFmpeg() {
-    av_log_set_level(AV_LOG_WARNING);
-    return true;
+bool StreamWorker::waitInterruptible(int ms) {
+    QMutexLocker locker(&m_waitMutex);
+    // I flag vengono controllati sotto lo stesso mutex usato da stop()/requestReconnect():
+    // impossibile perdere la sveglia (prima si poteva attendere fino a 60s in chiusura).
+    if (m_stopRequested.load(std::memory_order_acquire)) return false;
+    if (m_reconnectRequested.load(std::memory_order_acquire)) return true;
+    m_waitCondition.wait(&m_waitMutex, QDeadlineTimer(qint64(ms)));
+    return !m_stopRequested.load(std::memory_order_acquire);
 }
 
-void StreamWorker::cleanupFFmpeg() {
-    if (m_swsCtx) {
-        sws_freeContext(m_swsCtx);
-        m_swsCtx = nullptr;
-    }
-    
-    if (m_rgbBuffer) {
-        av_free(m_rgbBuffer);
-        m_rgbBuffer = nullptr;
-        m_rgbBufferSize = 0;
-    }
-    
-    if (m_frameRGB) {
-        av_frame_free(&m_frameRGB);
-        m_frameRGB = nullptr;
-    }
-    
-    if (m_frame) {
-        av_frame_free(&m_frame);
-        m_frame = nullptr;
-    }
-    
-    if (m_packet) {
-        av_packet_free(&m_packet);
-        m_packet = nullptr;
-    }
-    
-    if (m_codecCtx) {
-        avcodec_free_context(&m_codecCtx);
-        m_codecCtx = nullptr;
-    }
-    
-    if (m_formatCtx) {
-        avformat_close_input(&m_formatCtx);
-        m_formatCtx = nullptr;
-    }
-    
-    m_videoStreamIndex = -1;
+// ============================================================================
+// Interrupt callback: rende interrompibile ogni I/O bloccante di FFmpeg
+// ============================================================================
+
+int StreamWorker::interruptCallback(void* opaque) {
+    auto* self = static_cast<StreamWorker*>(opaque);
+    if (self->m_stopRequested.load(std::memory_order_relaxed)) return 1;
+    if (self->m_reconnectRequested.load(std::memory_order_relaxed)) return 1;
+    const int64_t deadline = self->m_deadlineNs.load(std::memory_order_relaxed);
+    return (deadline != 0 && nowNs() > deadline) ? 1 : 0;
+}
+
+void StreamWorker::armDeadline(int timeoutMs) {
+    m_deadlineNs.store(nowNs() + int64_t(std::max(500, timeoutMs)) * MS, std::memory_order_relaxed);
+}
+
+void StreamWorker::disarmDeadline() {
+    m_deadlineNs.store(0, std::memory_order_relaxed);
+}
+
+// ============================================================================
+// FFmpeg
+// ============================================================================
+
+AVDictionary* StreamWorker::createFormatOptions() const {
+    return buildFormatOptions(m_config);
 }
 
 bool StreamWorker::openStream() {
-    cleanupFFmpeg();
-    
+    closeStream();
+
     m_formatCtx = avformat_alloc_context();
     if (!m_formatCtx) {
-        m_lastError = "Failed to allocate format context";
+        setLastError("Impossibile allocare il format context");
         return false;
     }
-    
-    AVDictionary* opts = nullptr;
-    
-    if (m_config.enableTcp) {
-        av_dict_set(&opts, "rtsp_transport", "tcp", 0);
-    } else {
-        av_dict_set(&opts, "rtsp_transport", "udp", 0);
-    }
-    
-    av_dict_set(&opts, "stimeout", QString::number(m_config.connectionTimeoutMs * 1000).toUtf8().constData(), 0);
-    av_dict_set(&opts, "rw_timeout", QString::number(m_config.receiveTimeoutMs * 1000).toUtf8().constData(), 0);
-    
-    if (m_config.enableBuffering) {
-        av_dict_set(&opts, "buffer_size", "2097152", 0);  // 2MB buffer (era 1MB)
-        av_dict_set(&opts, "max_delay", "1000000", 0);   // 1s max delay (era 500ms)
-    }
-    
-    av_dict_set(&opts, "reorder_queue_size", "200", 0);  // Aumentato da 100
-    
-    // Opzioni extra per stabilità RTSP
-    av_dict_set(&opts, "rtsp_flags", "prefer_tcp", 0);   // Forza TCP anche se UDP disponibile
-    av_dict_set(&opts, "allowed_media_types", "video", 0);  // Solo video, niente audio
-    
-    m_formatCtx->flags |= AVFMT_FLAG_NONBLOCK | AVFMT_FLAG_DISCARD_CORRUPT;
-    
-    // Imposta max analyze duration per stream difficili (HEVC)
-    m_formatCtx->max_analyze_duration = 5000000;  // 5 secondi (default 5M)
-    m_formatCtx->probesize = 1000000;  // 1MB probe (default 5M)
-    
-    QString url = buildRtspUrl();
-    QByteArray urlBytes = url.toUtf8();
-    
-    int ret = avformat_open_input(&m_formatCtx, urlBytes.constData(), nullptr, &opts);
+    m_formatCtx->interrupt_callback.callback = &StreamWorker::interruptCallback;
+    m_formatCtx->interrupt_callback.opaque = this;
+    // NB: niente AVFMT_FLAG_NONBLOCK: faceva tornare EAGAIN che veniva contato come
+    // errore e provocava riconnessioni inutili. La reattività ora la dà l'interrupt callback.
+    m_formatCtx->flags |= AVFMT_FLAG_DISCARD_CORRUPT;
+    m_formatCtx->max_analyze_duration = 2 * AV_TIME_BASE;
+    m_formatCtx->probesize = 500000;
+
+    AVDictionary* opts = createFormatOptions();
+    const QByteArray url = m_config.buildStreamUrl().toUtf8();
+
+    armDeadline(m_config.connectionTimeoutMs);
+    int ret = avformat_open_input(&m_formatCtx, url.constData(), nullptr, &opts);
     av_dict_free(&opts);
-    
     if (ret < 0) {
-        m_lastError = FFmpegError::fromAvError(ret).message;
-        qWarning() << "Camera" << m_config.id << "failed to open stream:" << m_lastError;
+        disarmDeadline();
+        // avformat_open_input libera il contesto in caso di errore
+        m_formatCtx = nullptr;
+        setLastError(ret == AVERROR_EXIT ? QString("Timeout di connessione") : avErrorString(ret));
+        qWarning() << "Camera" << m_cameraId << "failed to open stream:" << m_lastError;
         return false;
     }
-    
+
     ret = avformat_find_stream_info(m_formatCtx, nullptr);
+    disarmDeadline();
     if (ret < 0) {
-        m_lastError = FFmpegError::fromAvError(ret).message;
-        qWarning() << "Camera" << m_config.id << "failed to find stream info:" << m_lastError;
+        setLastError(ret == AVERROR_EXIT ? QString("Timeout lettura informazioni stream") : avErrorString(ret));
+        qWarning() << "Camera" << m_cameraId << "failed to find stream info:" << m_lastError;
         return false;
     }
-    
-    const AVCodec* codecPtr = nullptr;
-    m_videoStreamIndex = av_find_best_stream(m_formatCtx, AVMEDIA_TYPE_VIDEO, -1, -1, &codecPtr, 0);
-    if (m_videoStreamIndex < 0) {
-        m_lastError = "No video stream found";
-        qWarning() << "Camera" << m_config.id << ": no video stream found";
+
+    const AVCodec* swCodec = nullptr;
+    m_videoStreamIndex = av_find_best_stream(m_formatCtx, AVMEDIA_TYPE_VIDEO, -1, -1, &swCodec, 0);
+    if (m_videoStreamIndex < 0 || !swCodec) {
+        setLastError("Nessuno stream video trovato");
         return false;
     }
-    
-    // Get stream codec parameters to determine codec ID
-    AVStream* stream = m_formatCtx->streams[m_videoStreamIndex];
-    enum AVCodecID codecId = stream->codecpar->codec_id;
-    
-    // === DETERMINE CODEC (Hardware or Software) ===
-    const AVCodec* selectedCodec = codecPtr;  // Default: software decoder
-    
-    if (m_config.enableHwAccel && !m_config.hwAccelType.isEmpty()) {
-        QString hwType = m_config.hwAccelType.toLower();
-        const char* hwDecoderName = nullptr;
-        
+    // Ignora gli altri stream a livello di demuxer
+    for (unsigned i = 0; i < m_formatCtx->nb_streams; ++i) {
+        if (int(i) != m_videoStreamIndex) m_formatCtx->streams[i]->discard = AVDISCARD_ALL;
+    }
+
+    const AVCodecID codecId = m_formatCtx->streams[m_videoStreamIndex]->codecpar->codec_id;
+
+    // === Selezione decoder (HW o SW) ===
+    const AVCodec* codec = swCodec;
+    bool useVaapi = false;
+    if (m_config.enableHwAccel) {
+        const QString hwType = m_config.hwAccelType.toLower();
+        const char* hwName = nullptr;
         if (hwType == "qsv") {
-            // Intel QuickSync via QSV
-            hwDecoderName = (codecId == AV_CODEC_ID_HEVC) ? "hevc_qsv" :
-                           (codecId == AV_CODEC_ID_H264) ? "h264_qsv" : nullptr;
+            hwName = codecId == AV_CODEC_ID_HEVC ? "hevc_qsv" : codecId == AV_CODEC_ID_H264 ? "h264_qsv" : nullptr;
         } else if (hwType == "cuda" || hwType == "nvdec") {
-            // NVIDIA NVDEC
-            hwDecoderName = (codecId == AV_CODEC_ID_HEVC) ? "hevc_cuvid" :
-                           (codecId == AV_CODEC_ID_H264) ? "h264_cuvid" : nullptr;
+            hwName = codecId == AV_CODEC_ID_HEVC ? "hevc_cuvid" : codecId == AV_CODEC_ID_H264 ? "h264_cuvid" : nullptr;
         } else if (hwType == "vaapi") {
-            // VAAPI (Intel/AMD on Linux)
-            hwDecoderName = (codecId == AV_CODEC_ID_HEVC) ? "hevc_vaapi" :
-                           (codecId == AV_CODEC_ID_H264) ? "h264_vaapi" : nullptr;
+            // VAAPI non è un decoder separato: si usa il decoder software con un device VAAPI
+            useVaapi = true;
         }
-        
-        if (hwDecoderName) {
-            const AVCodec* hwCodec = avcodec_find_decoder_by_name(hwDecoderName);
-            if (hwCodec) {
-                selectedCodec = hwCodec;
-                qInfo() << "Camera" << m_config.id << ": Hardware acceleration enabled -" << m_config.hwAccelType.toUpper();
+        if (hwName) {
+            if (const AVCodec* hw = avcodec_find_decoder_by_name(hwName)) {
+                codec = hw;
             } else {
-                qWarning() << "Camera" << m_config.id << ": HW decoder" << hwDecoderName << "not available, using software";
+                qWarning() << "Camera" << m_cameraId << ": HW decoder" << hwName << "non disponibile, uso software";
             }
         }
     }
-    
-    m_codec = const_cast<AVCodec*>(selectedCodec);
-    
-    // Now configure and open with the SELECTED codec (HW or SW)
-    configureCodecContext();
-    
-    ret = avcodec_open2(m_codecCtx, m_codec, nullptr);
+
+    configureCodecContext(codec, useVaapi);
+    ret = m_codecCtx ? avcodec_open2(m_codecCtx, codec, nullptr) : AVERROR(ENOMEM);
+    if (ret < 0 && (codec != swCodec || useVaapi)) {
+        qWarning() << "Camera" << m_cameraId << ": decoder HW fallito (" << avErrorString(ret) << "), uso software";
+        configureCodecContext(swCodec, false);  // libera il vecchio contesto (prima veniva perso)
+        ret = m_codecCtx ? avcodec_open2(m_codecCtx, swCodec, nullptr) : AVERROR(ENOMEM);
+    }
     if (ret < 0) {
-        m_lastError = FFmpegError::fromAvError(ret).message;
-        qWarning() << "Camera" << m_config.id << "failed to open codec:" << m_lastError;
-        
-        // Fallback to software if HW failed
-        if (selectedCodec != codecPtr) {
-            qWarning() << "Camera" << m_config.id << ": HW decode failed, falling back to software";
-            m_codec = const_cast<AVCodec*>(codecPtr);
-            configureCodecContext();  // Reconfigure with software codec
-            ret = avcodec_open2(m_codecCtx, m_codec, nullptr);
-            if (ret < 0) {
-                m_lastError = FFmpegError::fromAvError(ret).message;
-                return false;
-            }
-        } else {
-            return false;
-        }
+        setLastError(QString("Apertura decoder fallita: %1").arg(avErrorString(ret)));
+        return false;
     }
-    
+
     m_frame = av_frame_alloc();
-    m_frameRGB = av_frame_alloc();
+    m_swFrame = av_frame_alloc();
     m_packet = av_packet_alloc();
-    
-    if (!m_frame || !m_frameRGB || !m_packet) {
-        m_lastError = "Failed to allocate frames/packet";
+    if (!m_frame || !m_swFrame || !m_packet) {
+        setLastError("Memoria insufficiente (frame/packet)");
         return false;
     }
-    
-    m_swsCtx = sws_getContext(
-        m_codecCtx->width, m_codecCtx->height, m_codecCtx->pix_fmt,
-        m_codecCtx->width, m_codecCtx->height, AV_PIX_FMT_RGB24,
-        SWS_BILINEAR, nullptr, nullptr, nullptr
-    );
-    
-    if (!m_swsCtx) {
-        m_lastError = "Failed to create scaling context";
-        return false;
-    }
-    
-    m_rgbBufferSize = av_image_get_buffer_size(AV_PIX_FMT_RGB24, m_codecCtx->width, m_codecCtx->height, 1);
-    m_rgbBuffer = static_cast<uint8_t*>(av_malloc(m_rgbBufferSize));
-    
-    if (!m_rgbBuffer) {
-        m_lastError = "Failed to allocate RGB buffer";
-        return false;
-    }
-    
-    ret = av_image_fill_arrays(m_frameRGB->data, m_frameRGB->linesize, m_rgbBuffer, 
-                               AV_PIX_FMT_RGB24, m_codecCtx->width, m_codecCtx->height, 1);
-    if (ret < 0) {
-        m_lastError = FFmpegError::fromAvError(ret).message;
-        return false;
-    }
-    
-    qInfo() << "Camera" << m_config.id << "connected:" << m_codecCtx->width << "x" << m_codecCtx->height 
-            << "fps:" << av_q2d(m_codecCtx->framerate);
-    
+
+    qInfo() << "Camera" << m_cameraId << "connected:" << m_codecCtx->codec->name
+            << m_codecCtx->width << "x" << m_codecCtx->height;
     return true;
+}
+
+void StreamWorker::configureCodecContext(const AVCodec* codec, bool useVaapiDevice) {
+    if (m_codecCtx) avcodec_free_context(&m_codecCtx);
+
+    m_codecCtx = avcodec_alloc_context3(codec);
+    if (!m_codecCtx) return;
+
+    avcodec_parameters_to_context(m_codecCtx, m_formatCtx->streams[m_videoStreamIndex]->codecpar);
+
+    // 1 thread per camera: con 3 camere su una CPU debole è la scelta giusta
+    // (niente sovra-sottoscrizione dei core, nessun frame di latenza extra).
+    m_codecCtx->thread_count = 1;
+    m_codecCtx->flags2 |= AV_CODEC_FLAG2_FAST;
+    m_codecCtx->err_recognition = AV_EF_CAREFUL;
+
+    if (m_config.lowCpuDecode) {
+        // Salta il filtro di deblocking: ~20-30% CPU in meno su H.264/H.265,
+        // qualità leggermente inferiore (accettabile per videosorveglianza)
+        m_codecCtx->skip_loop_filter = AVDISCARD_ALL;
+    }
+
+    if (useVaapiDevice) {
+        AVBufferRef* hwDevice = nullptr;
+        if (av_hwdevice_ctx_create(&hwDevice, AV_HWDEVICE_TYPE_VAAPI, nullptr, nullptr, 0) >= 0) {
+            m_codecCtx->hw_device_ctx = hwDevice;  // il codec ctx prende possesso del riferimento
+            qInfo() << "Camera" << m_cameraId << ": VAAPI attivo";
+        } else {
+            qWarning() << "Camera" << m_cameraId << ": VAAPI non disponibile, uso software";
+        }
+    }
 }
 
 void StreamWorker::closeStream() {
-    if (m_codecCtx) {
-        // Flush decoder: manda packet vuoto per svuotare buffer
-        avcodec_send_packet(m_codecCtx, nullptr);
-        AVFrame* flushFrame = av_frame_alloc();
-        while (avcodec_receive_frame(m_codecCtx, flushFrame) == 0) {
-            av_frame_unref(flushFrame);
-        }
-        av_frame_free(&flushFrame);
-        
-        avcodec_flush_buffers(m_codecCtx);
+    // Rilascia TUTTO, inclusa la connessione: durante l'attesa di riconnessione la
+    // camera non resta con una sessione RTSP aperta (alcune Zosi accettano poche sessioni).
+    if (m_swsCtx) { sws_freeContext(m_swsCtx); m_swsCtx = nullptr; }
+    if (m_frame) av_frame_free(&m_frame);
+    if (m_swFrame) av_frame_free(&m_swFrame);
+    if (m_packet) av_packet_free(&m_packet);
+    if (m_codecCtx) avcodec_free_context(&m_codecCtx);
+    if (m_formatCtx) {
+        armDeadline(CLOSE_TIMEOUT_MS);  // il TEARDOWN RTSP non deve poter bloccare
+        avformat_close_input(&m_formatCtx);
+        disarmDeadline();
     }
+    m_videoStreamIndex = -1;
 }
 
-bool StreamWorker::decodeFrame() {
-    if (!m_formatCtx || !m_codecCtx || !m_frame || !m_packet) {
+bool StreamWorker::readAndDecode() {
+    armDeadline(m_config.receiveTimeoutMs);
+    int ret = av_read_frame(m_formatCtx, m_packet);
+    disarmDeadline();
+
+    if (ret == AVERROR(EAGAIN)) {
+        QThread::msleep(5);
+        return true;
+    }
+    if (ret < 0) {
+        if (ret == AVERROR_EXIT) {
+            setLastError(m_stopRequested || m_reconnectRequested
+                         ? QString("Interrotto")
+                         : QString("Nessun dato ricevuto da %1 ms").arg(m_config.receiveTimeoutMs));
+        } else if (ret == AVERROR_EOF) {
+            setLastError("Stream terminato dalla camera");
+        } else {
+            setLastError(avErrorString(ret));
+        }
         return false;
     }
-    
-    int ret = av_read_frame(m_formatCtx, m_packet);
-    if (ret < 0) {
-        if (ret == AVERROR_EOF || ret == AVERROR(EAGAIN)) {
+
+    if (m_packet->stream_index != m_videoStreamIndex) {
+        av_packet_unref(m_packet);
+        return true;
+    }
+
+    ret = avcodec_send_packet(m_codecCtx, m_packet);
+    av_packet_unref(m_packet);
+    if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) {
+        m_droppedFrames.fetch_add(1, std::memory_order_relaxed);
+        if (++m_decodeErrorsInRow >= MAX_DECODE_ERRORS_IN_ROW) {
+            setLastError(QString("Troppi errori di decodifica: %1").arg(avErrorString(ret)));
             return false;
         }
-        m_lastError = FFmpegError::fromAvError(ret).message;
-        return false;
+        reportError(QString("Errore decodifica: %1").arg(avErrorString(ret)));
+        return true;
     }
-    
-    bool result = true;
-    
-    if (m_packet->stream_index == m_videoStreamIndex) {
-        ret = avcodec_send_packet(m_codecCtx, m_packet);
-        if (ret < 0) {
-            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-                result = true;
-            } else {
-                m_lastError = FFmpegError::fromAvError(ret).message;
-                result = false;
-            }
-        } else {
-            while (ret >= 0) {
-                ret = avcodec_receive_frame(m_codecCtx, m_frame);
-                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-                    break;
-                } else if (ret < 0) {
-                    m_lastError = FFmpegError::fromAvError(ret).message;
-                    result = false;
-                    break;
-                }
-                
-                if (!processFrame(m_frame)) {
-                    result = false;
-                    av_frame_unref(m_frame);
-                    break;
-                }
-                
-                // RILASCIA il frame dopo averlo processato (fondamentale!)
-                av_frame_unref(m_frame);
-            }
-        }
-    }
-    
-    av_packet_unref(m_packet);
-    return result;
-}
 
-bool StreamWorker::processFrame(AVFrame* frame) {
-    int h = sws_scale(m_swsCtx, frame->data, frame->linesize, 0, m_codecCtx->height,
-                      m_frameRGB->data, m_frameRGB->linesize);
-    if (h < 0) {
-        m_lastError = "Frame scaling failed";
-        return false;
+    while (true) {
+        ret = avcodec_receive_frame(m_codecCtx, m_frame);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
+        if (ret < 0) {
+            m_droppedFrames.fetch_add(1, std::memory_order_relaxed);
+            ++m_decodeErrorsInRow;
+            break;
+        }
+        // Frame valido: azzera i contatori di errore (prima non succedeva mai durante
+        // la sessione, quindi errori sporadici si accumulavano fino a forzare il reconnect)
+        m_decodeErrorsInRow = 0;
+        m_lastFrameNs = nowNs();
+        m_totalFrames.fetch_add(1, std::memory_order_relaxed);
+        m_lastFrameTime.store(QDateTime::currentMSecsSinceEpoch(), std::memory_order_relaxed);
+
+        handleDecodedFrame(m_frame);
+        av_frame_unref(m_frame);
     }
-    
-    QImage image(m_rgbBuffer, m_codecCtx->width, m_codecCtx->height, 
-                 m_frameRGB->linesize[0], QImage::Format_RGB888);
-    
-    QImage imageCopy = image.copy();
-    
-    if (imageCopy.isNull()) {
-        return false;
-    }
-    
-    uint32_t frameNum = m_frameCounter.fetch_add(1, std::memory_order_relaxed);
-    qint64 timestamp = QDateTime::currentMSecsSinceEpoch();
-    
-    FrameData frameData(m_config.id, std::move(imageCopy), timestamp, frameNum);
-    emit frameReady(std::move(frameData));
-    
     return true;
 }
 
-void StreamWorker::configureCodecContext() {
-    if (!m_formatCtx || m_videoStreamIndex < 0) return;
-    
-    AVStream* stream = m_formatCtx->streams[m_videoStreamIndex];
-    m_codecCtx = avcodec_alloc_context3(m_codec);
-    
-    if (!m_codecCtx) return;
-    
-    avcodec_parameters_to_context(m_codecCtx, stream->codecpar);
-    
-    // Limita thread decoder per evitare accumulo frame
-    m_codecCtx->thread_count = 1;  // Single thread = meno buffering interno
-    m_codecCtx->thread_type = FF_THREAD_FRAME;
-    
-    // Error resilience
-    m_codecCtx->error_concealment = FF_EC_GUESS_MVS | FF_EC_DEBLOCK;
-    m_codecCtx->err_recognition = AV_EF_CAREFUL;  // Meno aggressivo di EXPLODE
-    
-    // Skip processing per frame corrotti
-    m_codecCtx->skip_frame = AVDISCARD_DEFAULT;
-    m_codecCtx->skip_idct = AVDISCARD_DEFAULT;
-    m_codecCtx->skip_loop_filter = AVDISCARD_DEFAULT;
-    
-    // Low latency flags
-    m_codecCtx->flags |= AV_CODEC_FLAG_LOW_DELAY;
-    m_codecCtx->flags2 |= AV_CODEC_FLAG2_FAST | AV_CODEC_FLAG2_LOCAL_HEADER;
-    
-    // Limita buffer interno decoder (FFmpeg 4.4+)
-    // Imposta max frame buffer per evitare accumulo memoria
-    av_opt_set_int(m_codecCtx, "max_frame_buffer", 3, 0);
-    
-    // Per HEVC/H.265: abilita error resilience extra
-    if (m_codecCtx->codec_id == AV_CODEC_ID_HEVC || m_codecCtx->codec_id == AV_CODEC_ID_H265) {
-        av_opt_set_int(m_codecCtx, "error_recognition", AV_EF_CAREFUL, 0);
+void StreamWorker::handleDecodedFrame(AVFrame* frame) {
+    const int64_t now = nowNs();
+
+    // 1) La GUI non ha ancora preso il frame precedente: è occupata, non sprecare CPU
+    //    a convertirne un altro. (Il decoder deve comunque decodificare tutto.)
+    if (m_frameNotifyPending.load(std::memory_order_acquire)) {
+        m_droppedFrames.fetch_add(1, std::memory_order_relaxed);
+        return;
     }
-    
-    // VAAPI hardware device context (if using VAAPI decoder)
-    if (m_config.enableHwAccel && m_config.hwAccelType.toLower() == "vaapi") {
-        AVBufferRef* hwDeviceCtx = nullptr;
-        int ret = av_hwdevice_ctx_create(&hwDeviceCtx, AV_HWDEVICE_TYPE_VAAPI, nullptr, nullptr, 0);
-        if (ret >= 0) {
-            m_codecCtx->hw_device_ctx = av_buffer_ref(hwDeviceCtx);
-            av_buffer_unref(&hwDeviceCtx);
-            qInfo() << "Camera" << m_config.id << ": VAAPI device context created";
-        } else {
-            qWarning() << "Camera" << m_config.id << ": Failed to create VAAPI device context";
+
+    // 2) Limite FPS di visualizzazione (con tolleranza del 25% per il jitter di rete)
+    const int64_t minInterval = SEC / std::clamp(m_config.fps, 1, 60);
+    if (m_lastEmitNs != 0 && now - m_lastEmitNs < minInterval - minInterval / 4) {
+        m_droppedFrames.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    // 3) Frame in memoria GPU (VAAPI): scaricalo in RAM
+    AVFrame* src = frame;
+    if (frame->hw_frames_ctx) {
+        av_frame_unref(m_swFrame);
+        if (av_hwframe_transfer_data(m_swFrame, frame, 0) < 0) {
+            m_droppedFrames.fetch_add(1, std::memory_order_relaxed);
+            return;
         }
+        src = m_swFrame;
+    }
+
+    const int srcW = src->width;
+    const int srcH = src->height;
+    if (srcW <= 0 || srcH <= 0) return;
+
+    // 4) Dimensione di uscita = dimensione del riquadro a schermo (mai ingrandire).
+    //    Ridimensionare qui, nel thread della camera, toglie tutto il lavoro alla GUI.
+    int dstW = srcW, dstH = srcH;
+    const uint64_t packed = m_targetSize.load(std::memory_order_relaxed);
+    const int tw = int(packed >> 32), th = int(packed & 0xffffffffu);
+    if (tw > 0 && th > 0) {
+        const double scale = std::min({double(tw) / srcW, double(th) / srcH, 1.0});
+        dstW = std::max(2, int(std::lround(srcW * scale)));
+        dstH = std::max(2, int(std::lround(srcH * scale)));
+    }
+
+    // sws_getCachedContext gestisce anche cambi di risoluzione a metà stream
+    // (prima il contesto era fisso e un cambio di risoluzione leggeva fuori buffer)
+    m_swsCtx = sws_getCachedContext(m_swsCtx,
+                                    srcW, srcH, AVPixelFormat(src->format),
+                                    dstW, dstH, AV_PIX_FMT_RGB32,
+                                    SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
+    if (!m_swsCtx) {
+        reportError("Conversione colore non supportata");
+        return;
+    }
+
+    // Converte direttamente nel buffer della QImage (niente copia extra).
+    // AV_PIX_FMT_RGB32 ha lo stesso layout di QImage::Format_RGB32: disegno senza conversioni.
+    QImage image(dstW, dstH, QImage::Format_RGB32);
+    if (image.isNull()) return;
+    uint8_t* dstData[4] = {image.bits(), nullptr, nullptr, nullptr};
+    int dstStride[4] = {int(image.bytesPerLine()), 0, 0, 0};
+    if (sws_scale(m_swsCtx, src->data, src->linesize, 0, srcH, dstData, dstStride) <= 0) {
+        return;
+    }
+
+    bool notify = false;
+    {
+        QMutexLocker locker(&m_frameMutex);
+        m_latestFrame = std::move(image);
+        notify = !m_frameNotifyPending.exchange(true, std::memory_order_acq_rel);
+    }
+    m_lastEmitNs = now;
+    m_displayedFrames.fetch_add(1, std::memory_order_relaxed);
+    if (notify) {
+        emit frameAvailable(m_cameraId);
     }
 }
 
+// ============================================================================
+// Helpers
+// ============================================================================
+
 void StreamWorker::setState(CameraState newState) {
-    CameraState oldState = m_state.load(std::memory_order_acquire);
-    if (oldState != newState) {
-        m_state.store(newState, std::memory_order_release);
+    const CameraState old = m_state.exchange(newState, std::memory_order_acq_rel);
+    if (old != newState) {
         emit stateChanged(newState);
     }
 }
 
-QString StreamWorker::buildRtspUrl() const {
-    // Use sub-stream if enabled and available
-    QString url = m_config.getActiveUrl();
-    
-    if (url.contains("@")) {
-        return url;
+void StreamWorker::setLastError(const QString& err) {
+    QMutexLocker locker(&m_errorMutex);
+    m_lastError = err;
+}
+
+void StreamWorker::reportError(const QString& err) {
+    // Rate limit: in 24h un errore ripetuto per ogni pacchetto riempirebbe log e coda eventi
+    const int64_t now = nowNs();
+    if (err == m_lastReportedError && now - m_lastReportNs < ERROR_REPORT_INTERVAL_NS) return;
+    m_lastReportedError = err;
+    m_lastReportNs = now;
+    emit errorOccurred(err);
+}
+
+// ============================================================================
+// Test connessione (thread secondario, mai nel thread GUI)
+// ============================================================================
+
+ProbeResult StreamWorker::probe(const CameraConfig& config, const std::atomic<bool>* cancel) {
+    ProbeResult result;
+    const QString url = config.buildStreamUrl();
+    if (url.isEmpty()) {
+        result.message = "URL vuoto";
+        return result;
     }
-    
-    if (!m_config.username.isEmpty() && !m_config.password.isEmpty()) {
-        int schemeEnd = url.indexOf("://");
-        if (schemeEnd != -1) {
-            int hostStart = schemeEnd + 3;
-            url.insert(hostStart, m_config.username + ":" + m_config.password + "@");
+
+    ProbeInterrupt irq;
+    irq.cancel = cancel;
+
+    AVFormatContext* fmt = avformat_alloc_context();
+    if (!fmt) {
+        result.message = "Memoria insufficiente";
+        return result;
+    }
+    fmt->interrupt_callback.callback = &probeInterruptCb;
+    fmt->interrupt_callback.opaque = &irq;
+    fmt->max_analyze_duration = 2 * AV_TIME_BASE;
+    fmt->probesize = 500000;
+
+    AVDictionary* opts = buildFormatOptions(config);
+    irq.deadlineNs = nowNs() + int64_t(std::max(1000, config.connectionTimeoutMs)) * MS;
+    const QByteArray urlBytes = url.toUtf8();
+    int ret = avformat_open_input(&fmt, urlBytes.constData(), nullptr, &opts);
+    av_dict_free(&opts);
+    if (ret < 0) {
+        result.message = ret == AVERROR_EXIT ? QString("Timeout di connessione") : avErrorString(ret);
+        return result;  // fmt già liberato da FFmpeg
+    }
+
+    ret = avformat_find_stream_info(fmt, nullptr);
+    if (ret < 0) {
+        result.message = ret == AVERROR_EXIT ? QString("Timeout lettura stream") : avErrorString(ret);
+    } else {
+        const int idx = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+        if (idx < 0) {
+            result.message = "Connesso, ma nessuno stream video trovato";
+        } else {
+            AVStream* st = fmt->streams[idx];
+            const double fps = st->avg_frame_rate.den ? av_q2d(st->avg_frame_rate) : 0.0;
+            result.ok = true;
+            result.message = QString("%1  %2×%3%4")
+                .arg(QString::fromUtf8(avcodec_get_name(st->codecpar->codec_id)).toUpper())
+                .arg(st->codecpar->width)
+                .arg(st->codecpar->height)
+                .arg(fps > 0 ? QString("  @ %1 fps").arg(fps, 0, 'f', 0) : QString());
         }
     }
-    
-    return url;
+
+    irq.deadlineNs = nowNs() + CLOSE_TIMEOUT_MS * MS;
+    avformat_close_input(&fmt);
+    return result;
 }

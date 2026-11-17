@@ -2,45 +2,79 @@
 #include "StreamWorker.h"
 #include "CameraConfig.h"
 #include <QPainter>
-#include <QMouseEvent>
 #include <QApplication>
-#include <QScreen>
 #include <QMessageBox>
-#include <QFileDialog>
 #include <QSettings>
 #include <QDebug>
-#include <QProcess>
-#include <QUrl>
+#include <QDateTime>
+#include <QPointer>
+#include <QScrollArea>
+#include <QHBoxLayout>
+#include <QVBoxLayout>
+#include <QStyle>
+#include <QThread>
 
-extern "C" {
-#include <libavformat/avformat.h>
-#include <libavutil/avutil.h>
-#include <libavutil/error.h>
+namespace {
+
+constexpr qint64 STALE_FRAME_MS = 5000;   // nessun frame da 5s con camera "connessa" → avviso a schermo
+
+const char* stateText(CameraState s) {
+    switch (s) {
+        case CameraState::Disconnected: return "Disconnessa";
+        case CameraState::Connecting:   return "Connessione...";
+        case CameraState::Connected:    return "Connessa";
+        case CameraState::Reconnecting: return "Riconnessione...";
+        case CameraState::Error:        return "Errore";
+    }
+    return "";
 }
+
+QColor stateColor(CameraState s) {
+    switch (s) {
+        case CameraState::Connected:    return QColor(76, 195, 138);
+        case CameraState::Connecting:   return QColor(240, 200, 80);
+        case CameraState::Reconnecting: return QColor(255, 165, 0);
+        case CameraState::Disconnected:
+        case CameraState::Error:        return QColor(240, 97, 109);
+    }
+    return Qt::white;
+}
+
+} // namespace
+
+// ============================================================================
+// VideoWidget
+// ============================================================================
 
 VideoWidget::VideoWidget(int cameraId, const QString& name, QWidget* parent)
     : QWidget(parent)
     , m_cameraId(cameraId)
     , m_name(name) {
-    
-    setMinimumSize(320, 240);
+    setMinimumSize(240, 135);
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-    setMouseTracking(true);
     setAttribute(Qt::WA_OpaquePaintEvent);
     setAttribute(Qt::WA_NoSystemBackground);
+
+    m_titleFont = font();
+    m_titleFont.setPointSize(11);
+    m_titleFont.setBold(true);
+    m_smallFont = font();
+    m_smallFont.setPointSize(9);
 }
 
 void VideoWidget::setImage(const QImage& image) {
     if (image.isNull()) return;
-    
     m_currentFrame = image;
-    m_needsRescale = true;
+    m_lastFrameTimer.restart();
+    m_lastFrameClock = QTime::currentTime().toString("HH:mm:ss");
+    m_stale = false;
     update();
 }
 
 void VideoWidget::setState(CameraState state) {
+    if (m_state == state) return;
     m_state = state;
-    m_needsRescale = true;
+    if (state == CameraState::Connected) m_errorText.clear();
     update();
 }
 
@@ -49,111 +83,117 @@ void VideoWidget::setError(const QString& error) {
     update();
 }
 
-void VideoWidget::paintEvent(QPaintEvent* event) {
-    Q_UNUSED(event);
-    
+void VideoWidget::setName(const QString& name) {
+    if (m_name == name) return;
+    m_name = name;
+    update();
+}
+
+void VideoWidget::setStale(bool stale) {
+    if (m_stale == stale) return;
+    m_stale = stale;
+    update();
+}
+
+qint64 VideoWidget::msSinceLastFrame() const {
+    return m_lastFrameTimer.isValid() ? m_lastFrameTimer.elapsed() : -1;
+}
+
+void VideoWidget::paintEvent(QPaintEvent*) {
     QPainter painter(this);
-    painter.setRenderHint(QPainter::SmoothPixmapTransform);
-    
     painter.fillRect(rect(), Qt::black);
-    
+
     if (!m_currentFrame.isNull()) {
-        if (m_needsRescale || m_scaledPixmap.isNull() || m_scaledPixmap.size() != size()) {
-            m_scaledPixmap = QPixmap::fromImage(m_currentFrame).scaled(
-                size(), Qt::KeepAspectRatio, Qt::SmoothTransformation);
-            m_needsRescale = false;
-        }
-        
-        if (!m_scaledPixmap.isNull()) {
-            QPoint center = rect().center() - m_scaledPixmap.rect().center();
-            painter.drawPixmap(center, m_scaledPixmap);
-        }
+        // Il frame arriva già alla dimensione giusta: di norma è un blit 1:1.
+        // Solo durante un ridimensionamento della finestra (finché il worker non si adegua)
+        // scaliamo qui, con trasformazione veloce.
+        // (Se la sorgente è più piccola del riquadro il worker non ingrandisce: lo fa drawImage.)
+        const QSize fitted = m_currentFrame.size().scaled(size(), Qt::KeepAspectRatio);
+        QRect target(QPoint(0, 0), fitted);
+        target.moveCenter(rect().center());
+        painter.setRenderHint(QPainter::SmoothPixmapTransform, false);
+        painter.drawImage(target, m_currentFrame);
     }
-    
-    QColor borderColor;
-    QString statusText;
-    
-    switch (m_state) {
-        case CameraState::Disconnected:
-            borderColor = Qt::red;
-            statusText = "Disconnessa";
-            break;
-        case CameraState::Connecting:
-            borderColor = Qt::yellow;
-            statusText = "Connessione...";
-            break;
-        case CameraState::Connected:
-            borderColor = Qt::green;
-            statusText = "Connessa";
-            break;
-        case CameraState::Reconnecting:
-            borderColor = QColor(255, 165, 0);  // orange
-            statusText = "Riconnessione...";
-            break;
-        case CameraState::Error:
-            borderColor = Qt::red;
-            statusText = "Errore";
-            break;
-    }
-    
-    QPen pen(borderColor, 3);
-    painter.setPen(pen);
-    painter.drawRect(rect().adjusted(1, 1, -2, -2));
-    
+
+    const QColor color = stateColor(m_state);
+
+    // Bordo di stato
+    painter.setPen(QPen(m_stale ? QColor(240, 97, 109) : color, 2));
+    painter.setBrush(Qt::NoBrush);
+    painter.drawRect(rect().adjusted(1, 1, -1, -1));
+
+    // Barra superiore semitrasparente con nome e stato
+    const int barH = 26;
+    painter.fillRect(QRect(2, 2, width() - 4, barH), QColor(0, 0, 0, 150));
+
+    painter.setFont(m_titleFont);
     painter.setPen(Qt::white);
-    painter.setFont(QFont("Arial", 12, QFont::Bold));
-    painter.drawText(10, 25, m_name);
-    
-    painter.setFont(QFont("Arial", 10));
-    QColor statusColor = borderColor;
-    if (m_state == CameraState::Connected) statusColor = Qt::lightGray;
-    painter.setPen(statusColor);
-    painter.drawText(10, 45, statusText);
-    
-    if (!m_errorText.isEmpty() && m_state != CameraState::Connected) {
-        painter.setPen(Qt::red);
-        painter.setFont(QFont("Arial", 9));
-        QRect errorRect = rect().adjusted(10, 65, -10, -10);
-        painter.drawText(errorRect, Qt::AlignLeft | Qt::TextWordWrap, m_errorText);
+    painter.drawText(QRect(10, 2, width() - 20, barH), Qt::AlignLeft | Qt::AlignVCenter, m_name);
+
+    painter.setFont(m_smallFont);
+    QString right;
+    if (m_state == CameraState::Connected && !m_stale) {
+        right = QString("● LIVE  %1").arg(m_lastFrameClock);
+    } else {
+        right = QString("● %1").arg(stateText(m_state));
     }
-    
-    if (m_state == CameraState::Connected) {
-        painter.setPen(Qt::green);
-        painter.setFont(QFont("Arial", 9));
-        painter.drawText(rect().adjusted(10, 10, -10, -10), Qt::AlignRight | Qt::AlignTop, "LIVE");
+    painter.setPen(m_stale ? QColor(240, 97, 109) : color);
+    painter.drawText(QRect(10, 2, width() - 20, barH), Qt::AlignRight | Qt::AlignVCenter, right);
+
+    // Messaggi centrali
+    QString center;
+    if (m_stale && m_state == CameraState::Connected) {
+        center = QString("Segnale assente\nultimo frame alle %1").arg(m_lastFrameClock);
+    } else if (m_state != CameraState::Connected) {
+        center = stateText(m_state);
+        if (!m_errorText.isEmpty()) center += "\n" + m_errorText;
+    }
+    if (!center.isEmpty()) {
+        QRect box = rect().adjusted(20, barH + 10, -20, -10);
+        painter.setPen(Qt::white);
+        QRect textRect = painter.boundingRect(box, Qt::AlignCenter | Qt::TextWordWrap, center);
+        painter.fillRect(textRect.adjusted(-12, -8, 12, 8), QColor(0, 0, 0, 170));
+        painter.drawText(box, Qt::AlignCenter | Qt::TextWordWrap, center);
     }
 }
 
 void VideoWidget::resizeEvent(QResizeEvent* event) {
     QWidget::resizeEvent(event);
-    m_needsRescale = true;
+    emit targetSizeChanged((QSizeF(size()) * devicePixelRatioF()).toSize());
 }
+
+// ============================================================================
+// MainWindow
+// ============================================================================
 
 MainWindow::MainWindow(CameraConfigManager* configManager, QWidget* parent)
     : QMainWindow(parent)
     , m_configManager(configManager) {
-    
+
     setupUI();
     setupMenuBar();
     setupStatusBar();
     createCameraWidgets();
-    
+
+    connect(m_configManager, &CameraConfigManager::configChanged,
+            this, &MainWindow::onConfigChanged);
+
     QSettings settings;
     restoreGeometry(settings.value("window/geometry").toByteArray());
     restoreState(settings.value("window/state").toByteArray());
-    
+
+    m_uptime.start();
     QTimer::singleShot(100, this, &MainWindow::startWorkers);
 }
 
 MainWindow::~MainWindow() {
     stopWorkers();
-    
-    QSettings settings;
-    settings.setValue("window/geometry", saveGeometry());
-    settings.setValue("window/state", saveState());
 }
 
 void MainWindow::closeEvent(QCloseEvent* event) {
+    QSettings settings;
+    settings.setValue("window/geometry", saveGeometry());
+    settings.setValue("window/state", saveState());
     stopWorkers();
     event->accept();
 }
@@ -161,114 +201,97 @@ void MainWindow::closeEvent(QCloseEvent* event) {
 void MainWindow::setupUI() {
     setWindowTitle("OmniGuard - Videosorveglianza Zosi (3 Camere)");
     resize(1280, 720);
-    setMinimumSize(960, 540);
-    
-    // Icona finestra (per barra titolo Linux)
+    setMinimumSize(640, 400);
     setWindowIcon(QIcon(":/omniguard.svg"));
-    
-    // Sfondo nero per tutta la finestra
-    setStyleSheet("QMainWindow { background-color: black; }"
-                  "QWidget { background-color: black; }"
-                  "QStatusBar { background-color: #1a1a1a; color: white; }"
-                  "QLabel { color: white; }"
-                  "QMenuBar { background-color: #1a1a1a; color: white; }"
-                  "QMenuBar::item:selected { background-color: #333; }"
-                  "QMenu { background-color: #1a1a1a; color: white; }"
-                  "QMenu::item:selected { background-color: #333; }");
-    
+
+    // NB: niente regola generica "QWidget { background: black }": veniva ereditata
+    // dal dialog di configurazione (figlio della finestra) rendendolo illeggibile.
+    setStyleSheet(
+        "QMainWindow { background-color: black; }"
+        "QWidget#centralWidget { background-color: black; }"
+        "QStatusBar { background-color: #15171a; color: #e6e8eb; }"
+        "QStatusBar QLabel { color: #e6e8eb; padding: 0 6px; }"
+        "QStatusBar::item { border: none; }"
+        "QMenuBar { background-color: #15171a; color: #e6e8eb; }"
+        "QMenuBar::item:selected { background-color: #2c3036; }"
+        "QMenu { background-color: #1e2126; color: #e6e8eb; border: 1px solid #2c3036; }"
+        "QMenu::item:selected { background-color: #2c3036; }");
+
     m_centralWidget = new QWidget(this);
-    m_centralWidget->setStyleSheet("background-color: black;");
+    m_centralWidget->setObjectName("centralWidget");
     m_gridLayout = new QGridLayout(m_centralWidget);
     m_gridLayout->setSpacing(4);
     m_gridLayout->setContentsMargins(4, 4, 4, 4);
-    
     setCentralWidget(m_centralWidget);
 }
 
 void MainWindow::setupMenuBar() {
     QMenuBar* menuBar = this->menuBar();
-    
+
     QMenu* fileMenu = menuBar->addMenu("&File");
-    
     QAction* configAction = fileMenu->addAction("&Configurazione Camere...", this, &MainWindow::openCameraConfig);
     configAction->setShortcut(QKeySequence::Preferences);
-    
     fileMenu->addSeparator();
-    
     QAction* quitAction = fileMenu->addAction("&Esci", this, &QWidget::close);
     quitAction->setShortcut(QKeySequence::Quit);
-    
+
     QMenu* viewMenu = menuBar->addMenu("&Visualizza");
-    
     QAction* fullscreenAction = viewMenu->addAction("&Schermo Intero", this, [this]() {
-        if (isFullScreen()) {
-            showNormal();
-        } else {
-            showFullScreen();
-        }
+        if (isFullScreen()) showNormal(); else showFullScreen();
     });
     fullscreenAction->setShortcut(Qt::Key_F11);
-    
+    // Funziona anche a schermo intero (quando la barra menu non è cliccabile)
+    addAction(fullscreenAction);
+    addAction(configAction);
+
+    viewMenu->addAction("&Riconnetti tutte le camere", this, [this]() {
+        for (auto& w : m_workers) if (w) w->requestReconnect();
+    });
+
     QMenu* helpMenu = menuBar->addMenu("&Aiuto");
-    helpMenu->addAction("&Informazioni", this, []() {
-        QMessageBox::about(nullptr, "OmniGuard", 
+    helpMenu->addAction("&Informazioni", this, [this]() {
+        QMessageBox::about(this, "OmniGuard",
             "OmniGuard v1.0\n"
             "Sistema di videosorveglianza per 3 telecamere IP Zosi\n"
-            "Basato su Qt 6 e FFmpeg\n\n"
-            "Architettura multithread per stabilita assoluta");
+            "Basato su Qt 6 e FFmpeg");
     });
 }
 
 void MainWindow::openCameraConfig() {
     CameraConfigDialog dialog(m_configManager, this);
-    if (dialog.exec() == QDialog::Accepted) {
-        // Config saved, apply changes
-        auto configs = m_configManager->getAllConfigs();
-        for (int i = 0; i < 3; ++i) {
-            if (configs[i].has_value() && m_workers[i]) {
-                m_workers[i]->requestReconnect();
-            }
-        }
-    }
+    // Le modifiche arrivano tramite CameraConfigManager::configChanged, emesso
+    // solo per le camere effettivamente modificate (le altre non si riconnettono).
+    dialog.exec();
 }
 
 void MainWindow::setupStatusBar() {
     m_statusBar = statusBar();
-    
+    m_statusBar->setSizeGripEnabled(false);
+
     for (int i = 0; i < 3; ++i) {
-        m_statusLabels[i] = new QLabel(QString("Cam %1: Inizializzazione...").arg(i + 1));
-        m_statusLabels[i]->setMinimumWidth(180);
+        m_statusLabels[i] = new QLabel(QString("Cam %1: avvio...").arg(i + 1));
         m_statusBar->addWidget(m_statusLabels[i]);
     }
-    
-    m_statusBar->addPermanentWidget(new QLabel(" | "));
-    
-    m_fpsLabel = new QLabel("FPS: --");
-    m_fpsLabel->setMinimumWidth(120);
-    m_statusBar->addPermanentWidget(m_fpsLabel);
-    
+
+    m_uptimeLabel = new QLabel();
+    m_statusBar->addPermanentWidget(m_uptimeLabel);
+
     m_statusTimer = new QTimer(this);
     m_statusTimer->setInterval(1000);
     connect(m_statusTimer, &QTimer::timeout, this, &MainWindow::updateStatusBar);
     m_statusTimer->start();
+    m_fpsTimer.start();
 }
 
 void MainWindow::createCameraWidgets() {
     auto configs = m_configManager->getAllConfigs();
-    
+
     for (int i = 0; i < 3; ++i) {
-        QString name = QString("Camera %1").arg(i + 1);
-        if (configs[i].has_value()) {
-            name = configs[i]->name;
-        }
-        
+        QString name = configs[i].has_value() ? configs[i]->name : QString("Camera %1").arg(i + 1);
         m_videoWidgets[i] = std::make_unique<VideoWidget>(i, name);
-        
-        int row = i / 2;
-        int col = i % 2;
-        m_gridLayout->addWidget(m_videoWidgets[i].get(), row, col);
+        m_gridLayout->addWidget(m_videoWidgets[i].get(), i / 2, i % 2);
     }
-    
+
     m_gridLayout->setRowStretch(0, 1);
     m_gridLayout->setRowStretch(1, 1);
     m_gridLayout->setColumnStretch(0, 1);
@@ -277,81 +300,57 @@ void MainWindow::createCameraWidgets() {
 
 void MainWindow::startWorkers() {
     auto configs = m_configManager->getAllConfigs();
-    
+
     for (int i = 0; i < 3; ++i) {
-        CameraConfig config;
-        if (configs[i].has_value()) {
-            config = configs[i].value();
-        } else {
-            config = CameraConfig(i, QString("Camera %1").arg(i + 1), 
-                QString("rtsp://192.168.1.%1:554/stream1").arg(100 + i));
-        }
-        
+        CameraConfig config = configs[i].has_value()
+            ? configs[i].value()
+            : CameraConfigManager::createDefaults()[i];
+
         m_workers[i] = std::make_unique<StreamWorker>(config);
-        
-        connect(m_workers[i].get(), &StreamWorker::frameReady,
-                this, &MainWindow::onFrameReady, Qt::QueuedConnection);
-        
-        connect(m_workers[i].get(), &StreamWorker::stateChanged,
-                this, [this, i](CameraState state) {
-                    onStateChanged(i, state);
-                }, Qt::QueuedConnection);
-        
-        connect(m_workers[i].get(), &StreamWorker::errorOccurred,
-                this, [this, i](const QString& error) {
-                    onErrorOccurred(i, error);
-                }, Qt::QueuedConnection);
-        
-        connect(m_workers[i].get(), &StreamWorker::connected,
-                this, [this, i]() {
-                    onConnected(i);
-                }, Qt::QueuedConnection);
-        
-        connect(m_workers[i].get(), &StreamWorker::disconnected,
-                this, [this, i](const QString& reason) {
-                    onDisconnected(i, reason);
-                }, Qt::QueuedConnection);
-        
-        m_workers[i]->start();
+        StreamWorker* worker = m_workers[i].get();
+        VideoWidget* widget = m_videoWidgets[i].get();
+
+        // Tutti i segnali dal thread della camera arrivano in coda alla GUI
+        connect(worker, &StreamWorker::frameAvailable,
+                this, &MainWindow::onFrameAvailable, Qt::QueuedConnection);
+        connect(worker, &StreamWorker::stateChanged,
+                this, [this, i](CameraState state) { onStateChanged(i, state); }, Qt::QueuedConnection);
+        connect(worker, &StreamWorker::errorOccurred,
+                this, [this, i](const QString& error) { onErrorOccurred(i, error); }, Qt::QueuedConnection);
+        connect(worker, &StreamWorker::disconnected,
+                this, [this, i](const QString& reason) { onErrorOccurred(i, reason); }, Qt::QueuedConnection);
+
+        // Il worker scala i frame alla dimensione del riquadro
+        connect(widget, &VideoWidget::targetSizeChanged, worker, &StreamWorker::setTargetSize);
+        worker->setTargetSize((QSizeF(widget->size()) * widget->devicePixelRatioF()).toSize());
+
+        worker->start();
     }
-    
-    connect(m_configManager, &CameraConfigManager::configChanged,
-            this, &MainWindow::onConfigChanged);
 }
 
 void MainWindow::stopWorkers() {
-    for (int i = 0; i < 3; ++i) {
-        if (m_workers[i]) {
-            m_workers[i]->stop();
-        }
-    }
-    
-    for (int i = 0; i < 3; ++i) {
-        if (m_workers[i] && m_workers[i]->isRunning()) {
-            QThread* thread = m_workers[i]->thread();
-            if (thread) {
-                thread->wait(3000);
-            }
-        }
-    }
-    
-    for (int i = 0; i < 3; ++i) {
-        m_workers[i].reset();
-    }
+    if (m_workersStopped) return;
+    m_workersStopped = true;
+
+    // Prima chiede a tutti di fermarsi (in parallelo), poi attende
+    for (auto& w : m_workers) if (w) w->requestStop();
+    for (auto& w : m_workers) if (w) w->stop();
+    for (auto& w : m_workers) w.reset();
 }
 
 void MainWindow::applyConfig(const CameraConfig& config) {
-    if (config.id >= 0 && config.id < 3 && m_workers[config.id]) {
-        m_workers[config.id]->requestReconnect();
-    }
+    if (config.id < 0 || config.id >= 3) return;
+    if (m_videoWidgets[config.id]) m_videoWidgets[config.id]->setName(config.name);
+    if (m_workers[config.id]) m_workers[config.id]->updateConfig(config);
 }
 
-void MainWindow::onFrameReady(FrameData frame) {
-    if (!frame.isValid()) return;
-    
-    int id = frame.cameraId;
-    if (id >= 0 && id < 3 && m_videoWidgets[id]) {
-        m_videoWidgets[id]->setImage(frame.image);
+void MainWindow::onFrameAvailable(int cameraId) {
+    if (cameraId < 0 || cameraId >= 3 || !m_workers[cameraId] || !m_videoWidgets[cameraId]) return;
+    // Prende solo il frame PIÙ RECENTE: se la GUI è rimasta indietro i frame intermedi
+    // sono già stati scartati dal worker, quindi non c'è mai accumulo di ritardo.
+    QImage frame = m_workers[cameraId]->takeLatestFrame();
+    if (!frame.isNull()) {
+        m_videoWidgets[cameraId]->setImage(frame);
     }
 }
 
@@ -365,430 +364,468 @@ void MainWindow::onErrorOccurred(int cameraId, const QString& error) {
     if (cameraId >= 0 && cameraId < 3 && m_videoWidgets[cameraId]) {
         m_videoWidgets[cameraId]->setError(error);
     }
-    qWarning() << "Camera" << cameraId << "error:" << error;
-}
-
-void MainWindow::onConnected(int cameraId) {
-    if (cameraId >= 0 && cameraId < 3 && m_statusLabels[cameraId]) {
-        m_statusLabels[cameraId]->setText(QString("Cam %1: Connessa").arg(cameraId + 1));
-        m_statusLabels[cameraId]->setStyleSheet("color: green;");
-    }
-}
-
-void MainWindow::onDisconnected(int cameraId, const QString& reason) {
-    if (cameraId >= 0 && cameraId < 3 && m_statusLabels[cameraId]) {
-        m_statusLabels[cameraId]->setText(QString("Cam %1: %2").arg(cameraId + 1).arg(reason));
-        m_statusLabels[cameraId]->setStyleSheet("color: orange;");
-    }
+    qWarning() << "Camera" << cameraId << ":" << error;
 }
 
 void MainWindow::updateStatusBar() {
-    QString fpsText = "FPS: ";
+    const double elapsedSec = std::max<qint64>(1, m_fpsTimer.restart()) / 1000.0;
+
     for (int i = 0; i < 3; ++i) {
-        if (m_workers[i]) {
-            CameraStatus status = m_workers[i]->getStatus();
-            uint64_t currentFrames = status.totalFrames;
-            double fps = (currentFrames - m_lastFrameCounts[i]) / 1.0;
-            m_currentFps[i] = fps;
-            m_lastFrameCounts[i] = currentFrames;
-            
-            if (i > 0) fpsText += " | ";
-            fpsText += QString("C%1: %2").arg(i + 1).arg(fps, 0, 'f', 1);
-        }
+        if (!m_workers[i] || !m_statusLabels[i]) continue;
+        const CameraStatus status = m_workers[i]->getStatus();
+        const double fps = (status.displayedFrames - m_lastDisplayedCounts[i]) / elapsedSec;
+        m_lastDisplayedCounts[i] = status.displayedFrames;
+
+        // Avviso "segnale assente" se la camera risulta connessa ma non arrivano frame
+        VideoWidget* w = m_videoWidgets[i].get();
+        const qint64 since = w ? w->msSinceLastFrame() : -1;
+        const bool stale = status.state == CameraState::Connected && since > STALE_FRAME_MS;
+        if (w) w->setStale(stale);
+
+        const QColor c = stale ? stateColor(CameraState::Error) : stateColor(status.state);
+        m_statusLabels[i]->setText(QString("<span style='color:%1'>●</span> Cam %2  %3")
+            .arg(c.name())
+            .arg(i + 1)
+            .arg(status.state == CameraState::Connected
+                 ? QString("%1 fps").arg(fps, 0, 'f', 1)
+                 : QString(stateText(status.state))));
     }
-    m_fpsLabel->setText(fpsText);
+
+    const qint64 s = m_uptime.elapsed() / 1000;
+    m_uptimeLabel->setText(QString("Attivo da %1g %2:%3:%4")
+        .arg(s / 86400)
+        .arg((s / 3600) % 24, 2, 10, QChar('0'))
+        .arg((s / 60) % 60, 2, 10, QChar('0'))
+        .arg(s % 60, 2, 10, QChar('0')));
 }
 
-void MainWindow::onConfigChanged(int cameraId, const CameraConfig& config) {
+void MainWindow::onConfigChanged(int, const CameraConfig& config) {
     applyConfig(config);
 }
 
-void MainWindow::onConfigDialogSaved() {
-    // Config saved signal from dialog - workers will be restarted via configChanged signal
-    qInfo() << "Configuration saved, cameras will reconnect with new settings";
+// ============================================================================
+// CameraConfigDialog
+// ============================================================================
+
+namespace {
+
+const char* kDialogStyle = R"(
+QDialog { background-color: #15171a; }
+QWidget#page, QScrollArea, QScrollArea > QWidget > QWidget { background-color: #15171a; }
+QLabel { color: #e6e8eb; background: transparent; }
+QLabel#title { font-size: 17px; font-weight: 600; }
+QLabel#subtitle, QLabel#hint { color: #9aa0a6; }
+QLabel#validation { color: #f0616d; font-weight: 600; }
+QTabWidget::pane { border: 1px solid #2c3036; border-radius: 6px; top: -1px; background: #15171a; }
+QTabBar::tab { background: #1e2126; color: #9aa0a6; padding: 8px 18px; margin-right: 2px;
+               border: 1px solid #2c3036; border-bottom: none;
+               border-top-left-radius: 6px; border-top-right-radius: 6px; }
+QTabBar::tab:selected { background: #15171a; color: #e6e8eb; font-weight: 600; }
+QTabBar::tab:hover:!selected { color: #e6e8eb; }
+QGroupBox { color: #e6e8eb; font-weight: 600; border: 1px solid #2c3036; border-radius: 6px;
+            margin-top: 14px; padding: 14px 10px 8px 10px; background: #1b1e22; }
+QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 6px; color: #9aa0a6; }
+QLineEdit, QSpinBox, QComboBox { background: #0f1113; color: #e6e8eb; border: 1px solid #2c3036;
+            border-radius: 4px; padding: 5px 8px; min-height: 20px;
+            selection-background-color: #3d8bfd; selection-color: white; }
+QLineEdit:focus, QSpinBox:focus, QComboBox:focus { border-color: #3d8bfd; }
+QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled { color: #5f656b; }
+QLineEdit[invalid="true"] { border-color: #f0616d; }
+QSpinBox { padding-right: 22px; }
+QSpinBox::up-button, QSpinBox::down-button { subcontrol-origin: border; width: 20px; border: none;
+            border-left: 1px solid #2c3036; background: #1e2126; }
+QSpinBox::up-button { subcontrol-position: top right; border-top-right-radius: 4px; }
+QSpinBox::down-button { subcontrol-position: bottom right; border-bottom-right-radius: 4px; }
+QSpinBox::up-button:hover, QSpinBox::down-button:hover { background: #2c3036; }
+QSpinBox::up-arrow { image: url(:/arrow-up.png); width: 10px; height: 6px; }
+QSpinBox::down-arrow { image: url(:/arrow-down.png); width: 10px; height: 6px; }
+QComboBox::drop-down { border: none; width: 22px; }
+QComboBox::down-arrow { image: url(:/arrow-down.png); width: 10px; height: 6px; }
+QComboBox QAbstractItemView { background: #1e2126; color: #e6e8eb; selection-background-color: #2c3036; }
+QCheckBox { color: #e6e8eb; spacing: 8px; background: transparent; }
+QCheckBox:disabled { color: #5f656b; }
+QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid #5f656b; border-radius: 3px; background: #0f1113; }
+QCheckBox::indicator:hover { border-color: #3d8bfd; }
+QCheckBox::indicator:checked { background: #3d8bfd; border-color: #3d8bfd;
+    image: url(:/check.png); }
+QPushButton { background: #2c3036; color: #e6e8eb; border: 1px solid #3a3f46; border-radius: 4px;
+              padding: 7px 16px; }
+QPushButton:hover { background: #353a41; }
+QPushButton:pressed { background: #24282d; }
+QPushButton:disabled { color: #5f656b; }
+QPushButton#primary { background: #3d8bfd; border-color: #3d8bfd; color: white; font-weight: 600; }
+QPushButton#primary:hover { background: #5a9cfd; }
+QScrollBar:vertical { background: #15171a; width: 10px; }
+QScrollBar::handle:vertical { background: #2c3036; border-radius: 4px; min-height: 30px; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+)";
+
+QLabel* makeHint(const QString& text, QWidget* parent) {
+    auto* l = new QLabel(text, parent);
+    l->setObjectName("hint");
+    l->setWordWrap(true);
+    return l;
 }
 
-// ============================================================================
-// CameraConfigDialog Implementation
-// ============================================================================
+QSpinBox* makeMsSpin(int min, int max, int step, QWidget* parent) {
+    auto* s = new QSpinBox(parent);
+    s->setRange(min, max);
+    s->setSingleStep(step);
+    s->setSuffix(" ms");
+    s->setMaximumWidth(140);
+    return s;
+}
+
+// Form con colonna etichette di larghezza fissa: i campi di tutti i gruppi restano allineati
+class AlignedForm {
+public:
+    explicit AlignedForm(QGroupBox* box) : m_box(box), m_form(new QFormLayout(box)) {
+        m_form->setSpacing(8);
+        m_form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+    }
+    void addRow(const QString& label, QWidget* field) {
+        auto* l = new QLabel(label, m_box);
+        l->setFixedWidth(165);
+        l->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        m_form->addRow(l, field);
+    }
+private:
+    QGroupBox* m_box;
+    QFormLayout* m_form;
+};
+
+} // namespace
 
 CameraConfigDialog::CameraConfigDialog(CameraConfigManager* configManager, QWidget* parent)
     : QDialog(parent)
     , m_configManager(configManager)
-{
+    , m_testCancel(std::make_shared<std::atomic<bool>>(false)) {
     setWindowTitle("Configurazione Telecamere");
-    setMinimumSize(700, 900);
     setModal(true);
-    
+    // Deve entrare anche in uno schermo 1366x768: il contenuto scorre
+    setMinimumSize(560, 420);
+    resize(720, 640);
+
     setupUI();
     loadConfig();
 }
 
+CameraConfigDialog::~CameraConfigDialog() {
+    // I test in corso terminano entro pochi ms (interrupt callback FFmpeg)
+    m_testCancel->store(true);
+}
+
 void CameraConfigDialog::setupUI() {
-    // Stile CSS pulito e curato nei colori per il menu di configurazione
-    setStyleSheet(
-        "QDialog { background-color: #f8f9fa; }"
-        "QTabWidget::pane { border: 1px solid #dee2e6; background-color: white; border-radius: 4px; }"
-        "QTabBar::tab { background-color: #e9ecef; color: #495057; padding: 8px 16px; "
-        "margin-right: 2px; border-top-left-radius: 4px; border-top-right-radius: 4px; border: 1px solid #dee2e6; border-bottom: none; }"
-        "QTabBar::tab:selected { background-color: white; color: #212529; font-weight: bold; border-bottom: 1px solid white; }"
-        "QTabBar::tab:hover { background-color: #dee2e6; }"
-        "QGroupBox { font-weight: bold; color: #495057; border: 1px solid #dee2e6; "
-        "border-radius: 4px; margin-top: 12px; padding-top: 10px; background-color: white; }"
-        "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #495057; background-color: white; }"
-        "QLabel { color: #495057; }"
-        "QLineEdit, QSpinBox, QComboBox { background-color: white; border: 1px solid #ced4da; "
-        "border-radius: 4px; padding: 4px 8px; color: #212529; selection-background-color: #0d6efd; selection-color: white; }"
-        "QLineEdit:focus, QSpinBox:focus, QComboBox:focus { border-color: #86b7fe; outline: none; }"
-        "QPushButton { background-color: #e9ecef; color: #212529; border: 1px solid #ced4da; "
-        "border-radius: 4px; padding: 6px 12px; font-weight: 500; }"
-        "QPushButton:hover { background-color: #dee2e6; border-color: #adb5bd; }"
-        "QPushButton:pressed { background-color: #ced4da; }"
-        "QDialogButtonBox QPushButton { min-width: 100px; padding: 8px 16px; }"
-    );
+    setStyleSheet(kDialogStyle);
 
-    QVBoxLayout* mainLayout = new QVBoxLayout(this);
+    auto* mainLayout = new QVBoxLayout(this);
     mainLayout->setSpacing(10);
-    mainLayout->setContentsMargins(15, 15, 15, 15);
+    mainLayout->setContentsMargins(16, 16, 16, 16);
 
-    // Title label
-    QLabel* titleLabel = new QLabel("Configurazione Telecamere IP", this);
-    titleLabel->setAlignment(Qt::AlignCenter);
-    titleLabel->setStyleSheet("font-size: 18px; font-weight: 600; color: #212529; margin-bottom: 10px; padding: 10px; background-color: white; border-radius: 6px; border: 1px solid #dee2e6;");
-    mainLayout->addWidget(titleLabel);
+    auto* title = new QLabel("Configurazione telecamere", this);
+    title->setObjectName("title");
+    auto* subtitle = new QLabel("Salvando, si riconnettono solo le telecamere modificate. "
+                                "Le altre continuano a trasmettere senza interruzioni.", this);
+    subtitle->setObjectName("subtitle");
+    subtitle->setWordWrap(true);
+    mainLayout->addWidget(title);
+    mainLayout->addWidget(subtitle);
 
-    // Tab widget for cameras
     m_tabWidget = new QTabWidget(this);
-    m_tabWidget->setTabPosition(QTabWidget::North);
-    
+    m_tabWidget->setDocumentMode(false);
     for (int i = 0; i < 3; ++i) {
-        CameraTab& tab = m_cameraTabs[i];
-        tab.widget = new QWidget();
-        QFormLayout* formLayout = new QFormLayout(tab.widget);
-        formLayout->setSpacing(10);
-        formLayout->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
-        formLayout->setFormAlignment(Qt::AlignHCenter | Qt::AlignTop);
-        formLayout->setContentsMargins(20, 20, 20, 20);
-
-        // Camera Name
-        tab.nameEdit = new QLineEdit(tab.widget);
-        tab.nameEdit->setPlaceholderText(QString("Camera %1").arg(i + 1));
-        tab.nameEdit->setMinimumWidth(400);
-        formLayout->addRow("Nome:", tab.nameEdit);
-
-        // RTSP URL (Main Stream)
-        tab.rtspUrlEdit = new QLineEdit(tab.widget);
-        tab.rtspUrlEdit->setPlaceholderText("rtsp://192.168.1.xxx:554/stream1");
-        tab.rtspUrlEdit->setMinimumWidth(400);
-        formLayout->addRow("URL Stream Principale:", tab.rtspUrlEdit);
-
-        // Sub-stream URL
-        tab.subStreamUrlEdit = new QLineEdit(tab.widget);
-        tab.subStreamUrlEdit->setPlaceholderText("rtsp://192.168.1.xxx:554/stream2 (opzionale)");
-        tab.subStreamUrlEdit->setMinimumWidth(400);
-        formLayout->addRow("URL Sub-Stream:", tab.subStreamUrlEdit);
-
-        // Username
-        tab.usernameEdit = new QLineEdit(tab.widget);
-        tab.usernameEdit->setPlaceholderText("admin");
-        tab.usernameEdit->setMinimumWidth(400);
-        formLayout->addRow("Username:", tab.usernameEdit);
-
-        // Password
-        tab.passwordEdit = new QLineEdit(tab.widget);
-        tab.passwordEdit->setEchoMode(QLineEdit::Password);
-        tab.passwordEdit->setPlaceholderText("password");
-        tab.passwordEdit->setMinimumWidth(400);
-        formLayout->addRow("Password:", tab.passwordEdit);
-
-        // Use Sub-stream checkbox
-        tab.useSubStreamCheck = new QCheckBox("Usa sub-stream (bassa risoluzione) per monitoraggio", tab.widget);
-        formLayout->addRow("", tab.useSubStreamCheck);
-        connect(tab.useSubStreamCheck, &QCheckBox::checkStateChanged, 
-                this, [this, i](Qt::CheckState state) { onUseSubStreamChanged(i, state == Qt::Checked); });
-
-        // Sub-stream URL row (initially hidden)
-        tab.subStreamUrlEdit->setVisible(false);
-        QWidget* subStreamLabel = formLayout->labelForField(tab.subStreamUrlEdit);
-        if (subStreamLabel) subStreamLabel->setVisible(false);
-
-        // Group: Connection Settings
-        QGroupBox* connGroup = new QGroupBox("Impostazioni Connessione", tab.widget);
-        QFormLayout* connLayout = new QFormLayout(connGroup);
-        connLayout->setSpacing(8);
-        
-        tab.reconnectIntervalSpin = new QSpinBox(tab.widget);
-        tab.reconnectIntervalSpin->setRange(1000, 60000);
-        tab.reconnectIntervalSpin->setSingleStep(1000);
-        tab.reconnectIntervalSpin->setSuffix(" ms");
-        tab.reconnectIntervalSpin->setValue(3000);
-        connLayout->addRow("Intervallo Riconnessione:", tab.reconnectIntervalSpin);
-
-        tab.connectionTimeoutSpin = new QSpinBox(tab.widget);
-        tab.connectionTimeoutSpin->setRange(1000, 60000);
-        tab.connectionTimeoutSpin->setSingleStep(1000);
-        tab.connectionTimeoutSpin->setSuffix(" ms");
-        tab.connectionTimeoutSpin->setValue(10000);
-        connLayout->addRow("Timeout Connessione:", tab.connectionTimeoutSpin);
-
-        tab.receiveTimeoutSpin = new QSpinBox(tab.widget);
-        tab.receiveTimeoutSpin->setRange(1000, 60000);
-        tab.receiveTimeoutSpin->setSingleStep(1000);
-        tab.receiveTimeoutSpin->setSuffix(" ms");
-        tab.receiveTimeoutSpin->setValue(5000);
-        connLayout->addRow("Timeout Ricezione:", tab.receiveTimeoutSpin);
-
-        tab.enableTcpCheck = new QCheckBox("Usa TCP per RTSP (più affidabile)", tab.widget);
-        tab.enableTcpCheck->setChecked(true);
-        connLayout->addRow("", tab.enableTcpCheck);
-
-        tab.enableBufferingCheck = new QCheckBox("Abilita buffering di rete", tab.widget);
-        tab.enableBufferingCheck->setChecked(true);
-        connLayout->addRow("", tab.enableBufferingCheck);
-
-        formLayout->addRow(connGroup);
-
-        // Group: Video Settings
-        QGroupBox* videoGroup = new QGroupBox("Impostazioni Video", tab.widget);
-        QFormLayout* videoLayout = new QFormLayout(videoGroup);
-        videoLayout->setSpacing(8);
-
-        tab.widthSpin = new QSpinBox(tab.widget);
-        tab.widthSpin->setRange(160, 3840);
-        tab.widthSpin->setSingleStep(16);
-        tab.widthSpin->setValue(1920);
-        videoLayout->addRow("Larghezza:", tab.widthSpin);
-
-        tab.heightSpin = new QSpinBox(tab.widget);
-        tab.heightSpin->setRange(120, 2160);
-        tab.heightSpin->setSingleStep(16);
-        tab.heightSpin->setValue(1080);
-        videoLayout->addRow("Altezza:", tab.heightSpin);
-
-        tab.fpsSpin = new QSpinBox(tab.widget);
-        tab.fpsSpin->setRange(1, 60);
-        tab.fpsSpin->setValue(25);
-        videoLayout->addRow("FPS:", tab.fpsSpin);
-
-        formLayout->addRow(videoGroup);
-
-        // Group: Hardware Acceleration
-        QGroupBox* hwGroup = new QGroupBox("Accelerazione Hardware", tab.widget);
-        QFormLayout* hwLayout = new QFormLayout(hwGroup);
-        hwLayout->setSpacing(8);
-
-        tab.enableHwAccelCheck = new QCheckBox("Abilita accelerazione hardware", tab.widget);
-        hwLayout->addRow("", tab.enableHwAccelCheck);
-
-        tab.hwAccelTypeCombo = new QComboBox(tab.widget);
-        tab.hwAccelTypeCombo->addItems({"qsv (Intel QuickSync)", "cuda (NVIDIA)", "vaapi (AMD/Intel)", "auto"});
-        tab.hwAccelTypeCombo->setEnabled(false);
-        hwLayout->addRow("Tipo:", tab.hwAccelTypeCombo);
-        
-        connect(tab.enableHwAccelCheck, &QCheckBox::toggled, 
-                tab.hwAccelTypeCombo, &QComboBox::setEnabled);
-
-        formLayout->addRow(hwGroup);
-
-        // Test Connection Button
-        QHBoxLayout* testLayout = new QHBoxLayout();
-        tab.testBtn = new QPushButton("Testa Connessione", tab.widget);
-        tab.testBtn->setMinimumHeight(35);
-        tab.testBtn->setStyleSheet(
-            "QPushButton { background-color: #0d6efd; color: white; font-weight: 600; border-radius: 4px; padding: 8px 16px; }"
-            "QPushButton:hover { background-color: #0b5ed7; }"
-            "QPushButton:pressed { background-color: #0a58ca; }"
-            "QPushButton:disabled { background-color: #6c757d; color: #adb5bd; }"
-        );
-        connect(tab.testBtn, &QPushButton::clicked, this, [this, i]() { onTestConnection(i); });
-        testLayout->addStretch();
-        testLayout->addWidget(tab.testBtn);
-        testLayout->addStretch();
-        formLayout->addRow(testLayout);
-
-        // Test Status Label
-        tab.testStatusLabel = new QLabel("", tab.widget);
-        tab.testStatusLabel->setAlignment(Qt::AlignCenter);
-        tab.testStatusLabel->setStyleSheet("color: #6c757d; font-style: italic;");
-        tab.testStatusLabel->setWordWrap(true);
-        formLayout->addRow("", tab.testStatusLabel);
-
-        m_tabWidget->addTab(tab.widget, QString("Camera %1").arg(i + 1));
+        auto* scroll = new QScrollArea(m_tabWidget);
+        scroll->setWidgetResizable(true);
+        scroll->setFrameShape(QFrame::NoFrame);
+        scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        scroll->setWidget(buildCameraPage(i));
+        m_tabWidget->addTab(scroll, QString("Camera %1").arg(i + 1));
     }
+    mainLayout->addWidget(m_tabWidget, 1);
 
-    mainLayout->addWidget(m_tabWidget);
-
-    // Button box
-    m_buttonBox = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel, this);
-    m_buttonBox->button(QDialogButtonBox::Save)->setText("Salva");
-    m_buttonBox->button(QDialogButtonBox::Cancel)->setText("Annulla");
-    m_buttonBox->button(QDialogButtonBox::Save)->setMinimumWidth(100);
-    m_buttonBox->button(QDialogButtonBox::Cancel)->setMinimumWidth(100);
-    
+    m_buttonBox = new QDialogButtonBox(this);
+    QPushButton* saveBtn = m_buttonBox->addButton("Salva e applica", QDialogButtonBox::AcceptRole);
+    saveBtn->setObjectName("primary");
+    saveBtn->setDefault(true);
+    m_buttonBox->addButton("Annulla", QDialogButtonBox::RejectRole);
     connect(m_buttonBox, &QDialogButtonBox::accepted, this, &CameraConfigDialog::onSave);
-    connect(m_buttonBox, &QDialogButtonBox::rejected, this, &CameraConfigDialog::onCancel);
-    
+    connect(m_buttonBox, &QDialogButtonBox::rejected, this, &QDialog::reject);
     mainLayout->addWidget(m_buttonBox);
+}
+
+QWidget* CameraConfigDialog::buildCameraPage(int i) {
+    CameraTab& tab = m_cameraTabs[i];
+    tab.page = new QWidget();
+    tab.page->setObjectName("page");
+    auto* layout = new QVBoxLayout(tab.page);
+    layout->setContentsMargins(12, 4, 12, 12);
+    layout->setSpacing(4);
+
+    // --- Generale ---
+    auto* generalBox = new QGroupBox("Generale", tab.page);
+    AlignedForm generalForm(generalBox);
+    tab.nameEdit = new QLineEdit(generalBox);
+    tab.nameEdit->setPlaceholderText(QString("Camera %1").arg(i + 1));
+    generalForm.addRow("Nome:", tab.nameEdit);
+    connect(tab.nameEdit, &QLineEdit::textChanged, this, [this, i](const QString& t) {
+        m_tabWidget->setTabText(i, t.trimmed().isEmpty() ? QString("Camera %1").arg(i + 1) : t.trimmed());
+    });
+    layout->addWidget(generalBox);
+
+    // --- Stream ---
+    auto* streamBox = new QGroupBox("Stream RTSP", tab.page);
+    AlignedForm streamForm(streamBox);
+    tab.rtspUrlEdit = new QLineEdit(streamBox);
+    tab.rtspUrlEdit->setPlaceholderText("rtsp://192.168.1.xxx:554/stream1");
+    streamForm.addRow("Stream principale:", tab.rtspUrlEdit);
+
+    tab.subStreamUrlEdit = new QLineEdit(streamBox);
+    tab.subStreamUrlEdit->setPlaceholderText("rtsp://192.168.1.xxx:554/stream2  (opzionale)");
+    streamForm.addRow("Sub-stream:", tab.subStreamUrlEdit);
+
+    tab.streamTypeCombo = new QComboBox(streamBox);
+    tab.streamTypeCombo->addItem("Stream principale (alta risoluzione)");
+    tab.streamTypeCombo->addItem("Sub-stream (consigliato su PC poco potenti)");
+    streamForm.addRow("Da visualizzare:", tab.streamTypeCombo);
+    streamForm.addRow("", makeHint("Il sub-stream ha una risoluzione più bassa: riduce CPU e banda "
+                                    "di 5-10 volte ed è più che sufficiente per una griglia di 3 camere.",
+                                    streamBox));
+    for (QLineEdit* e : {tab.rtspUrlEdit, tab.subStreamUrlEdit}) {
+        connect(e, &QLineEdit::textEdited, this, [this, e]() { markInvalid(e, false); });
+    }
+    layout->addWidget(streamBox);
+
+    // --- Credenziali ---
+    auto* credBox = new QGroupBox("Credenziali", tab.page);
+    AlignedForm credForm(credBox);
+    tab.usernameEdit = new QLineEdit(credBox);
+    tab.usernameEdit->setPlaceholderText("admin");
+    credForm.addRow("Utente:", tab.usernameEdit);
+
+    auto* pwRow = new QWidget(credBox);
+    auto* pwLayout = new QHBoxLayout(pwRow);
+    pwLayout->setContentsMargins(0, 0, 0, 0);
+    tab.passwordEdit = new QLineEdit(pwRow);
+    tab.passwordEdit->setEchoMode(QLineEdit::Password);
+    tab.showPasswordCheck = new QCheckBox("Mostra", pwRow);
+    pwLayout->addWidget(tab.passwordEdit, 1);
+    pwLayout->addWidget(tab.showPasswordCheck);
+    connect(tab.showPasswordCheck, &QCheckBox::toggled, tab.passwordEdit, [&tab](bool on) {
+        tab.passwordEdit->setEchoMode(on ? QLineEdit::Normal : QLineEdit::Password);
+    });
+    credForm.addRow("Password:", pwRow);
+    credForm.addRow("", makeHint("Lascia vuoto se utente e password sono già nell'URL "
+                                  "(rtsp://utente:password@indirizzo...).", credBox));
+    layout->addWidget(credBox);
+
+    // --- Prestazioni ---
+    auto* perfBox = new QGroupBox("Prestazioni", tab.page);
+    AlignedForm perfForm(perfBox);
+    tab.fpsSpin = new QSpinBox(perfBox);
+    tab.fpsSpin->setRange(1, 60);
+    tab.fpsSpin->setSuffix(" fps");
+    tab.fpsSpin->setMaximumWidth(140);
+    perfForm.addRow("FPS massimi a schermo:", tab.fpsSpin);
+    perfForm.addRow("", makeHint("Su PC poco potenti 10-15 fps sono sufficienti e dimezzano il carico.", perfBox));
+
+    tab.lowCpuCheck = new QCheckBox("Decodifica leggera (salta il deblocking, meno CPU)", perfBox);
+    perfForm.addRow("", tab.lowCpuCheck);
+
+    tab.enableHwAccelCheck = new QCheckBox("Accelerazione hardware", perfBox);
+    tab.hwAccelTypeCombo = new QComboBox(perfBox);
+    tab.hwAccelTypeCombo->addItem("VAAPI (Intel / AMD su Linux)", "vaapi");
+    tab.hwAccelTypeCombo->addItem("QuickSync (Intel)", "qsv");
+    tab.hwAccelTypeCombo->addItem("NVDEC (NVIDIA)", "cuda");
+    tab.hwAccelTypeCombo->setEnabled(false);
+    connect(tab.enableHwAccelCheck, &QCheckBox::toggled, tab.hwAccelTypeCombo, &QComboBox::setEnabled);
+    perfForm.addRow("", tab.enableHwAccelCheck);
+    perfForm.addRow("Tipo:", tab.hwAccelTypeCombo);
+    perfForm.addRow("", makeHint("Se l'accelerazione non è disponibile si torna automaticamente al software.", perfBox));
+    layout->addWidget(perfBox);
+
+    // --- Rete (avanzate) ---
+    auto* netBox = new QGroupBox("Rete (avanzate)", tab.page);
+    AlignedForm netForm(netBox);
+    tab.enableTcpCheck = new QCheckBox("Usa TCP per RTSP (consigliato, più affidabile)", netBox);
+    netForm.addRow("", tab.enableTcpCheck);
+    tab.enableBufferingCheck = new QCheckBox("Buffer di rete ampio (tollera meglio il Wi-Fi)", netBox);
+    netForm.addRow("", tab.enableBufferingCheck);
+    tab.reconnectIntervalSpin = makeMsSpin(1000, 60000, 1000, netBox);
+    netForm.addRow("Attesa tra riconnessioni:", tab.reconnectIntervalSpin);
+    tab.connectionTimeoutSpin = makeMsSpin(2000, 60000, 1000, netBox);
+    netForm.addRow("Timeout connessione:", tab.connectionTimeoutSpin);
+    tab.receiveTimeoutSpin = makeMsSpin(2000, 60000, 1000, netBox);
+    netForm.addRow("Timeout ricezione dati:", tab.receiveTimeoutSpin);
+    layout->addWidget(netBox);
+
+    // --- Test ---
+    auto* testRow = new QHBoxLayout();
+    testRow->setContentsMargins(0, 10, 0, 0);
+    tab.testBtn = new QPushButton("Testa connessione", tab.page);
+    connect(tab.testBtn, &QPushButton::clicked, this, [this, i]() { onTestConnection(i); });
+    tab.testStatusLabel = new QLabel(tab.page);
+    tab.testStatusLabel->setWordWrap(true);
+    tab.testStatusLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    testRow->addWidget(tab.testBtn);
+    testRow->addWidget(tab.testStatusLabel, 1);
+    layout->addLayout(testRow);
+
+    tab.validationLabel = new QLabel(tab.page);
+    tab.validationLabel->setObjectName("validation");
+    tab.validationLabel->setWordWrap(true);
+    tab.validationLabel->hide();
+    layout->addWidget(tab.validationLabel);
+
+    layout->addStretch();
+    return tab.page;
 }
 
 void CameraConfigDialog::loadConfig() {
     auto configs = m_configManager->getAllConfigs();
-    
+    auto defaults = CameraConfigManager::createDefaults();
+
     for (int i = 0; i < 3; ++i) {
         CameraTab& tab = m_cameraTabs[i];
-        
-        if (configs[i].has_value()) {
-            const CameraConfig& config = configs[i].value();
-            
-            tab.nameEdit->setText(config.name);
-            tab.rtspUrlEdit->setText(config.rtspUrl);
-            tab.subStreamUrlEdit->setText(config.subStreamUrl);
-            tab.usernameEdit->setText(config.username);
-            tab.passwordEdit->setText(config.password);
-            tab.useSubStreamCheck->setChecked(config.useSubStream);
-            tab.reconnectIntervalSpin->setValue(config.reconnectIntervalMs);
-            tab.connectionTimeoutSpin->setValue(config.connectionTimeoutMs);
-            tab.receiveTimeoutSpin->setValue(config.receiveTimeoutMs);
-            tab.enableTcpCheck->setChecked(config.enableTcp);
-            tab.enableBufferingCheck->setChecked(config.enableBuffering);
-            tab.widthSpin->setValue(config.width);
-            tab.heightSpin->setValue(config.height);
-            tab.fpsSpin->setValue(config.fps);
-            tab.enableHwAccelCheck->setChecked(config.enableHwAccel);
-            
-            int hwIndex = tab.hwAccelTypeCombo->findText(config.hwAccelType);
-            if (hwIndex >= 0) {
-                tab.hwAccelTypeCombo->setCurrentIndex(hwIndex);
-            }
-            
-            updateSubStreamFields(i, config.useSubStream);
-        }
+        const CameraConfig& c = configs[i].has_value() ? configs[i].value() : defaults[i];
+
+        tab.nameEdit->setText(c.name);
+        tab.rtspUrlEdit->setText(c.rtspUrl);
+        tab.subStreamUrlEdit->setText(c.subStreamUrl);
+        tab.streamTypeCombo->setCurrentIndex(c.useSubStream ? 1 : 0);
+        tab.usernameEdit->setText(c.username);
+        tab.passwordEdit->setText(c.password);
+        tab.fpsSpin->setValue(c.fps);
+        tab.lowCpuCheck->setChecked(c.lowCpuDecode);
+        tab.enableHwAccelCheck->setChecked(c.enableHwAccel);
+        tab.hwAccelTypeCombo->setEnabled(c.enableHwAccel);
+        int hwIndex = tab.hwAccelTypeCombo->findData(c.hwAccelType.toLower());
+        tab.hwAccelTypeCombo->setCurrentIndex(hwIndex >= 0 ? hwIndex : 0);
+        tab.enableTcpCheck->setChecked(c.enableTcp);
+        tab.enableBufferingCheck->setChecked(c.enableBuffering);
+        tab.reconnectIntervalSpin->setValue(c.reconnectIntervalMs);
+        tab.connectionTimeoutSpin->setValue(c.connectionTimeoutMs);
+        tab.receiveTimeoutSpin->setValue(c.receiveTimeoutMs);
     }
 }
 
-void CameraConfigDialog::saveConfig() {
-    for (int i = 0; i < 3; ++i) {
-        CameraTab& tab = m_cameraTabs[i];
-        
-        CameraConfig config;
-        config.id = i;
-        config.name = tab.nameEdit->text().trimmed();
-        config.rtspUrl = tab.rtspUrlEdit->text().trimmed();
-        config.subStreamUrl = tab.subStreamUrlEdit->text().trimmed();
-        config.username = tab.usernameEdit->text().trimmed();
-        config.password = tab.passwordEdit->text();
-        config.useSubStream = tab.useSubStreamCheck->isChecked();
-        config.reconnectIntervalMs = tab.reconnectIntervalSpin->value();
-        config.connectionTimeoutMs = tab.connectionTimeoutSpin->value();
-        config.receiveTimeoutMs = tab.receiveTimeoutSpin->value();
-        config.enableTcp = tab.enableTcpCheck->isChecked();
-        config.enableBuffering = tab.enableBufferingCheck->isChecked();
-        config.width = tab.widthSpin->value();
-        config.height = tab.heightSpin->value();
-        config.fps = tab.fpsSpin->value();
-        config.enableHwAccel = tab.enableHwAccelCheck->isChecked();
-        config.hwAccelType = tab.hwAccelTypeCombo->currentText().split(" ").first();
-        
-        if (config.name.isEmpty()) {
-            config.name = QString("Camera %1").arg(i + 1);
-        }
-        if (config.rtspUrl.isEmpty()) {
-            tab.testStatusLabel->setText("<span style='color: red;'>URL stream principale richiesto</span>");
-            m_tabWidget->setCurrentIndex(i);
-            return;
-        }
-        
-        m_configManager->updateConfig(config);
+CameraConfig CameraConfigDialog::configFromTab(int i) const {
+    const CameraTab& tab = m_cameraTabs[i];
+    // Parte dalla config esistente: i campi non presenti nel dialog (es. width/height) restano invariati
+    CameraConfig c = m_configManager->getConfig(i).value_or(CameraConfigManager::createDefaults()[i]);
+    c.id = i;
+    c.name = tab.nameEdit->text().trimmed();
+    if (c.name.isEmpty()) c.name = QString("Camera %1").arg(i + 1);
+    c.rtspUrl = tab.rtspUrlEdit->text().trimmed();
+    c.subStreamUrl = tab.subStreamUrlEdit->text().trimmed();
+    c.useSubStream = tab.streamTypeCombo->currentIndex() == 1;
+    c.username = tab.usernameEdit->text().trimmed();
+    c.password = tab.passwordEdit->text();
+    c.fps = tab.fpsSpin->value();
+    c.lowCpuDecode = tab.lowCpuCheck->isChecked();
+    c.enableHwAccel = tab.enableHwAccelCheck->isChecked();
+    c.hwAccelType = tab.hwAccelTypeCombo->currentData().toString();
+    c.enableTcp = tab.enableTcpCheck->isChecked();
+    c.enableBuffering = tab.enableBufferingCheck->isChecked();
+    c.reconnectIntervalMs = tab.reconnectIntervalSpin->value();
+    c.connectionTimeoutMs = tab.connectionTimeoutSpin->value();
+    c.receiveTimeoutMs = tab.receiveTimeoutSpin->value();
+    return c;
+}
+
+void CameraConfigDialog::markInvalid(QWidget* w, bool invalid) {
+    w->setProperty("invalid", invalid);
+    w->style()->unpolish(w);
+    w->style()->polish(w);
+}
+
+bool CameraConfigDialog::validateTab(int i) {
+    CameraTab& tab = m_cameraTabs[i];
+    auto isRtsp = [](const QString& u) {
+        return u.startsWith("rtsp://", Qt::CaseInsensitive) || u.startsWith("rtsps://", Qt::CaseInsensitive);
+    };
+
+    QString error;
+    QLineEdit* bad = nullptr;
+    const QString mainUrl = tab.rtspUrlEdit->text().trimmed();
+    const QString subUrl = tab.subStreamUrlEdit->text().trimmed();
+
+    if (mainUrl.isEmpty()) {
+        error = "Inserisci l'URL dello stream principale.";
+        bad = tab.rtspUrlEdit;
+    } else if (!isRtsp(mainUrl)) {
+        error = "L'URL dello stream principale deve iniziare con rtsp://";
+        bad = tab.rtspUrlEdit;
+    } else if (tab.streamTypeCombo->currentIndex() == 1 && subUrl.isEmpty()) {
+        error = "Hai scelto di visualizzare il sub-stream ma il suo URL è vuoto.";
+        bad = tab.subStreamUrlEdit;
+    } else if (!subUrl.isEmpty() && !isRtsp(subUrl)) {
+        error = "L'URL del sub-stream deve iniziare con rtsp://";
+        bad = tab.subStreamUrlEdit;
     }
-    
-    if (m_configManager->saveToFile(m_configManager->defaultConfigPath())) {
-        emit configSaved();
-        accept();
-    } else {
-        QMessageBox::critical(this, "Errore", "Impossibile salvare il file di configurazione.");
+
+    markInvalid(tab.rtspUrlEdit, bad == tab.rtspUrlEdit);
+    markInvalid(tab.subStreamUrlEdit, bad == tab.subStreamUrlEdit);
+    tab.validationLabel->setText(error);
+    tab.validationLabel->setVisible(!error.isEmpty());
+
+    if (bad) {
+        m_tabWidget->setCurrentIndex(i);
+        bad->setFocus();
+        return false;
     }
+    return true;
 }
 
 void CameraConfigDialog::onSave() {
-    saveConfig();
-}
-
-void CameraConfigDialog::onCancel() {
-    reject();
+    for (int i = 0; i < 3; ++i) {
+        if (!validateTab(i)) return;
+    }
+    for (int i = 0; i < 3; ++i) {
+        m_configManager->updateConfig(configFromTab(i));  // emette configChanged solo se cambiata
+    }
+    if (!m_configManager->saveToFile(m_configManager->configPath())) {
+        QMessageBox::critical(this, "Errore",
+            "Le modifiche sono state applicate ma non è stato possibile salvare il file:\n"
+            + m_configManager->configPath());
+        return;
+    }
+    emit configSaved();
+    accept();
 }
 
 void CameraConfigDialog::onTestConnection(int cameraId) {
+    if (!validateTab(cameraId)) return;
+
     CameraTab& tab = m_cameraTabs[cameraId];
     tab.testBtn->setEnabled(false);
     tab.testBtn->setText("Test in corso...");
-    tab.testStatusLabel->setText("<span style='color: #f39c12;'>Test connessione in corso...</span>");
-    QApplication::processEvents();
-    
-    CameraConfig config;
-    config.id = cameraId;
-    config.rtspUrl = tab.rtspUrlEdit->text().trimmed();
-    config.subStreamUrl = tab.subStreamUrlEdit->text().trimmed();
-    config.username = tab.usernameEdit->text().trimmed();
-    config.password = tab.passwordEdit->text();
-    config.useSubStream = tab.useSubStreamCheck->isChecked();
-    config.enableTcp = tab.enableTcpCheck->isChecked();
-    config.enableBuffering = tab.enableBufferingCheck->isChecked();
-    config.connectionTimeoutMs = tab.connectionTimeoutSpin->value();
-    config.receiveTimeoutMs = tab.receiveTimeoutSpin->value();
-    
-    QString testUrl = config.getActiveUrl();
-    
-    if (testUrl.isEmpty()) {
-        tab.testStatusLabel->setText("<span style='color: red;'>URL non valido</span>");
-        tab.testBtn->setEnabled(true);
-        tab.testBtn->setText("Testa Connessione");
-        return;
-    }
-    
-    AVFormatContext* fmtCtx = nullptr;
-    AVDictionary* options = nullptr;
-    
-    if (config.enableTcp) {
-        av_dict_set(&options, "rtsp_transport", "tcp", 0);
-    }
-    if (config.enableBuffering) {
-        av_dict_set(&options, "buffer_size", "1024000", 0);
-    }
-    av_dict_set(&options, "stimeout", QString::number(config.receiveTimeoutMs * 1000).toUtf8().constData(), 0);
-    
-    if (!config.username.isEmpty()) {
-        QUrl url(testUrl);
-        url.setUserName(config.username);
-        url.setPassword(config.password);
-        testUrl = url.toString();
-    }
-    
-    int ret = avformat_open_input(&fmtCtx, testUrl.toUtf8().constData(), nullptr, &options);
-    av_dict_free(&options);
-    
-    if (ret >= 0) {
-        avformat_close_input(&fmtCtx);
-        tab.testStatusLabel->setText("<span style='color: #27ae60; font-weight: bold;'>✓ Connessione riuscita!</span>");
-    } else {
-        char errbuf[AV_ERROR_MAX_STRING_SIZE];
-        av_strerror(ret, errbuf, sizeof(errbuf));
-        tab.testStatusLabel->setText(QString("<span style='color: #e74c3c;'>✗ Errore: %1</span>").arg(QString::fromUtf8(errbuf)));
-    }
-    
-    tab.testBtn->setEnabled(true);
-    tab.testBtn->setText("Testa Connessione");
+    tab.testStatusLabel->setText("<span style='color:#f0c850'>Connessione in corso...</span>");
+
+    const CameraConfig cfg = configFromTab(cameraId);
+    auto cancel = m_testCancel;
+    QPointer<CameraConfigDialog> self(this);
+
+    // Il test gira in un thread separato: prima bloccava la GUI (e quindi il video
+    // di TUTTE le camere) fino al timeout, che con FFmpeg 6 poteva non scattare mai.
+    QThread* thread = QThread::create([cfg, cancel, self, cameraId]() {
+        const ProbeResult result = StreamWorker::probe(cfg, cancel.get());
+        QMetaObject::invokeMethod(qApp, [self, cameraId, result]() {
+            if (self) self->onTestFinished(cameraId, result);
+        }, Qt::QueuedConnection);
+    });
+    connect(thread, &QThread::finished, thread, &QObject::deleteLater);
+    thread->start(QThread::LowPriority);
 }
 
-void CameraConfigDialog::onUseSubStreamChanged(int cameraId, bool enabled) {
-    updateSubStreamFields(cameraId, enabled);
-}
-
-void CameraConfigDialog::updateSubStreamFields(int cameraId, bool enabled) {
+void CameraConfigDialog::onTestFinished(int cameraId, const ProbeResult& result) {
     CameraTab& tab = m_cameraTabs[cameraId];
-    tab.subStreamUrlEdit->setVisible(enabled);
-    QFormLayout* formLayout = qobject_cast<QFormLayout*>(tab.widget->layout());
-    if (formLayout) {
-        QWidget* lbl = formLayout->labelForField(tab.subStreamUrlEdit);
-        if (lbl) lbl->setVisible(enabled);
+    tab.testBtn->setEnabled(true);
+    tab.testBtn->setText("Testa connessione");
+    if (result.ok) {
+        tab.testStatusLabel->setText(QString("<span style='color:#4cc38a; font-weight:600'>✓ Connessa</span>"
+                                             " <span style='color:#9aa0a6'>— %1</span>").arg(result.message.toHtmlEscaped()));
+    } else {
+        tab.testStatusLabel->setText(QString("<span style='color:#f0616d; font-weight:600'>✗ Errore:</span> %1")
+                                     .arg(result.message.toHtmlEscaped()));
     }
 }

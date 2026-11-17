@@ -42,11 +42,12 @@ struct CameraConfig {
     bool useSubStream = false;      // Use sub-stream instead of main stream
     bool enableHwAccel = false;     // Enable hardware acceleration (Intel QSV/NVDEC)
     QString hwAccelType;            // "qsv" (Intel), "cuda" (NVIDIA), "vaapi" (AMD/Intel)
+    bool lowCpuDecode = false;      // Salta il deblocking del decoder (meno CPU, qualità un po' inferiore)
     
     // Video settings
-    int width = 1920;               // Video width
-    int height = 1080;              // Video height
-    int fps = 25;                   // Frames per second
+    int width = 1920;               // Non usato dal worker (mantenuto per compatibilità JSON)
+    int height = 1080;              // Non usato dal worker (mantenuto per compatibilità JSON)
+    int fps = 25;                   // FPS massimi mostrati a schermo (il decoder legge comunque tutto)
     
     CameraConfig() = default;
     CameraConfig(int id_, const QString& name_, const QString& url_)
@@ -59,6 +60,23 @@ struct CameraConfig {
         }
         return rtspUrl;
     }
+    
+    // URL effettivo con credenziali inserite (se non già presenti nell'URL).
+    // Usato sia dal worker che dal "Testa connessione": devono comportarsi uguale.
+    QString buildStreamUrl() const {
+        QString url = getActiveUrl();
+        if (username.isEmpty() || password.isEmpty()) return url;
+        const int schemeEnd = url.indexOf("://");
+        if (schemeEnd < 0) return url;
+        const int hostStart = schemeEnd + 3;
+        const int pathStart = url.indexOf('/', hostStart);
+        const QString authority = url.mid(hostStart, pathStart < 0 ? -1 : pathStart - hostStart);
+        if (authority.contains('@')) return url;  // credenziali già nell'URL
+        url.insert(hostStart, username + ":" + password + "@");
+        return url;
+    }
+    
+    bool operator==(const CameraConfig&) const = default;
 };
 
 // Frame data structure for thread-safe signal/slot communication
@@ -88,7 +106,8 @@ struct FrameData {
 struct CameraStatus {
     CameraState state = CameraState::Disconnected;
     int consecutiveFailures = 0;
-    uint64_t totalFrames = 0;
+    uint64_t totalFrames = 0;       // frame decodificati
+    uint64_t displayedFrames = 0;   // frame consegnati alla GUI
     uint64_t droppedFrames = 0;
     qint64 lastFrameTime = 0;
     QString lastError;

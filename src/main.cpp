@@ -5,6 +5,7 @@
 #include <QMessageBox>
 #include <QDir>
 #include <QDebug>
+#include <QTimer>
 #include <csignal>
 #include <cstdlib>
 
@@ -14,16 +15,13 @@ extern "C" {
 #include <libavutil/avutil.h>
 }
 
-// Global flag for graceful shutdown
-static std::atomic<bool> g_shutdownRequested{false};
-static QApplication* g_app = nullptr;
+// Global flag for graceful shutdown.
+// L'handler di segnale fa SOLO una scrittura atomica (async-signal-safe):
+// qInfo()/invokeMethod dentro un handler possono andare in deadlock.
+static volatile std::sig_atomic_t g_shutdownRequested = 0;
 
-void signalHandler(int signum) {
-    qInfo() << "Received signal" << signum << ", initiating graceful shutdown...";
-    g_shutdownRequested.store(true);
-    if (g_app) {
-        QMetaObject::invokeMethod(g_app, "quit", Qt::QueuedConnection);
-    }
+extern "C" void signalHandler(int) {
+    g_shutdownRequested = 1;
 }
 
 int main(int argc, char* argv[]) {
@@ -36,7 +34,6 @@ int main(int argc, char* argv[]) {
     av_log_set_level(AV_LOG_WARNING);
     
     QApplication app(argc, argv);
-    g_app = &app;
     
     app.setApplicationName("OmniGuard");
     app.setApplicationVersion("1.0.0");
@@ -82,6 +79,17 @@ int main(int argc, char* argv[]) {
     } else {
         mainWindow.show();
     }
+    
+    // Controlla il flag di shutdown dal thread GUI
+    QTimer shutdownPoll;
+    QObject::connect(&shutdownPoll, &QTimer::timeout, &app, [&mainWindow]() {
+        if (g_shutdownRequested) {
+            qInfo() << "Signal received, initiating graceful shutdown...";
+            mainWindow.close();
+            QCoreApplication::quit();
+        }
+    });
+    shutdownPoll.start(250);
     
     // Run application
     int result = app.exec();
